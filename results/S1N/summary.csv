@@ -1,0 +1,13 @@
+scenario,clientID,stage,samples,p95_ms,p99_ms,max_ms
+S1N,light-producer-5,ack_received,1094,75.895,300.585,446.945
+S1N,light-producer-4,ack_received,1094,28.431,148.717,375.201
+S1N,light-producer-3,ack_received,1094,29.348,168.686,374.304
+S1N,light-producer-2,ack_received,1094,33.460,179.490,379.739
+S1N,heavy-producer-1,ack_received,70081,3989.837,4739.514,4910.811
+S1N,light-producer-1,ack_received,1094,73.679,229.664,370.982
+S1N,light-producer-5,service_gap,1094,77.515,140.038,413.961
+S1N,light-producer-4,service_gap,1094,61.749,90.124,423.388
+S1N,light-producer-3,service_gap,1094,62.187,90.801,419.007
+S1N,light-producer-2,service_gap,1094,62.209,104.015,418.057
+S1N,heavy-producer-1,service_gap,70081,5.200,11.007,391.283
+S1N,light-producer-1,service_gap,1094,77.457,136.469,413.930

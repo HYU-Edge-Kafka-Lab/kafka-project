@@ -1,0 +1,5 @@
+scenario,clientID,stage,samples,p95_ms,p99_ms,max_ms
+S1,heavy-producer-1,ack_received,130795,2467.442,3040.024,3336.689
+S1,light-producer-1,ack_received,5478,6.936,12.871,80.501
+S1,heavy-producer-1,service_gap,130795,2.851,5.651,90.302
+S1,light-producer-1,service_gap,5478,13.926,17.326,88.963

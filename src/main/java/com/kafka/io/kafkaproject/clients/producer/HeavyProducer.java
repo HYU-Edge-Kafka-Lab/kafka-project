@@ -1,13 +1,17 @@
 package com.kafka.io.kafkaproject.clients.producer;
 
+import com.kafka.io.kafkaproject.logging.StageLogger;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.io.IOException;
 import java.util.Properties;
-import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Heavy Producer - 고부하 연속 전송 클라이언트
@@ -22,9 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * - 메시지 크기: 10KB
  *
  * 사용 시나리오:
- * - S1: Heavy vs Light Producer (10,000 TPS)
- * - S2: Slow Consumer Backpressure (5,000 TPS)
- * - S3: Control-plane 혼합 (5,000 TPS)
+ * - S0: Balanced Load (1,000 TPS, 대조군)
+ * - S1: Heavy vs Light Producer (10000 TPS, 폭주)
  */
 public class HeavyProducer implements AutoCloseable {
 
@@ -33,11 +36,20 @@ public class HeavyProducer implements AutoCloseable {
 
     private final KafkaProducer<String, String> producer;
     private final String clientId;
+    private final StageLogger logger;
+
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
-    public HeavyProducer(String bootstrapServers, int producerId) {
+    private final ConcurrentHashMap<String, Long> startNanos=new ConcurrentHashMap<>();
+
+    private final AtomicLong lastAckNanos = new AtomicLong(-1L);
+
+    private final Semaphore inflight=new Semaphore(3000);
+
+    public HeavyProducer(String scenarioId, String bootstrapServers, int producerId) throws IOException {
         this.clientId = "heavy-producer-" + producerId;
         this.producer = createProducer(bootstrapServers);
+        this.logger=new StageLogger(scenarioId, clientId);
     }
 
     private KafkaProducer<String, String> createProducer(String bootstrapServers) {
@@ -67,26 +79,81 @@ public class HeavyProducer implements AutoCloseable {
         // - targetTps에 맞춰 전송 속도 조절
         // - 메시지 key: {clientId}-{timestamp}-{seq}
         // - send_start timestamp 기록
+        final long intervalNanos=1_000_000_000L/targetTps;
+
+        final long startTime=System.nanoTime();
+        final long endTime=startTime+durationSeconds*1_000_000_000L;
+
+//        다음 send 예정 시각
+        long nextSendTime=startTime;
+
+        while(System.nanoTime()<endTime){
+            long now=System.nanoTime();
+
+            // 아직 보낼 시간이 아니면 남은 시간만큼 기다린다
+            if(now<nextSendTime){
+                LockSupport.parkNanos(nextSendTime-now);
+                continue;
+            }
+
+            sendMessage();
+
+            nextSendTime+=intervalNanos;
+
+            long after = System.nanoTime();
+            if (after - nextSendTime > 1_000_000_000L) { // 1초 이상 밀렸다면
+                nextSendTime = after;
+            }
+        }
     }
 
     /**
      * 단일 메시지 전송
      */
     public void sendMessage() {
+        try{
+            inflight.acquire();
+        }catch(InterruptedException e){
+            Thread.currentThread().interrupt();
+            return;
+
+        }
         long seq = sequenceNumber.incrementAndGet();
         long timestamp = System.currentTimeMillis();
 
-        String key = String.format("%s-%d-%d", clientId, timestamp, seq);
+        String requestId = String.format("%s-%d-%d", clientId, timestamp, seq);
         String value = generatePayload(MESSAGE_SIZE_BYTES);
 
-        ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, key, value);
+        ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, requestId, value);
 
-        // TODO: send_start 로깅
+        // send_start 로깅
+        long start=System.nanoTime();
+        startNanos.put(requestId, start);
+        logger.logStage(clientId, "send_start", requestId);
+
         producer.send(record, (metadata, exception) -> {
-            // TODO: ack_received 로깅
-            if (exception != null) {
-                exception.printStackTrace();
+            // ack_received 로깅
+            try{
+                Long st=startNanos.remove(requestId);
+                long end=System.nanoTime();
+                if (exception != null) {
+                    logger.logStage(clientId, "ack_error", requestId);
+                    exception.printStackTrace();
+                    return;
+                }
+                long prevAck=lastAckNanos.getAndSet(end);
+                if(prevAck>0){
+                    logger.logLatency(clientId, "service_gap", requestId, prevAck, end);
+                }
+                if(st!=null) {
+                    logger.logLatency(clientId, "ack_received", requestId, st, end);
+                }else{
+                    logger.logStage(clientId, "ack_received", requestId);
+                }
+            }finally {
+                inflight.release();
             }
+
         });
     }
 
@@ -97,6 +164,12 @@ public class HeavyProducer implements AutoCloseable {
 
     @Override
     public void close() {
-        producer.close();
+        try{
+            producer.flush();
+        }finally {
+            producer.close();
+            logger.close();
+        }
+
     }
 }

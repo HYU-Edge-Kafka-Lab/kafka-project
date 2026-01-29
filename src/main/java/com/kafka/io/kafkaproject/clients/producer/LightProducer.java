@@ -1,12 +1,16 @@
 package com.kafka.io.kafkaproject.clients.producer;
 
+import com.kafka.io.kafkaproject.logging.StageLogger;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.io.IOException;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Light Producer - 저부하 간헐적 전송 클라이언트
@@ -23,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * 역할:
  * - Starvation 피해자 역할
  * - Heavy Producer와의 비교 대상
- * - p95/p99 latency 측정 대상 (KICKOFF.md 3.1절)
+ *
  *
  * 사용 시나리오:
  * - S0: Balanced Load (1,000 TPS, 대조군)
@@ -37,11 +41,18 @@ public class LightProducer implements AutoCloseable {
 
     private final KafkaProducer<String, String> producer;
     private final String clientId;
+    private final StageLogger logger;
+
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
-    public LightProducer(String bootstrapServers, int producerId) {
+    private final ConcurrentHashMap<String, Long> startNanos=new ConcurrentHashMap<>();
+
+    private final AtomicLong lastAckNanos=new AtomicLong(-1L);
+
+    public LightProducer(String scenarioId, String bootstrapServers, int producerId) throws IOException {
         this.clientId = "light-producer-" + producerId;
         this.producer = createProducer(bootstrapServers);
+        this.logger=new StageLogger(scenarioId, clientId);
     }
 
     private KafkaProducer<String, String> createProducer(String bootstrapServers) {
@@ -60,23 +71,33 @@ public class LightProducer implements AutoCloseable {
         return new KafkaProducer<>(props);
     }
 
-    /**
-     * 간헐적 전송 실행 (100ms 간격)
-     *
-     * @param durationSeconds 실행 시간(초)
-     */
-    public void runIntervalSend(int durationSeconds) throws InterruptedException {
-        long endTime = System.currentTimeMillis() + (durationSeconds * 1000L);
 
-        while (System.currentTimeMillis() < endTime) {
-            long sendStart = System.nanoTime();
+    public void runControlledSend(int targetTps, int durationSeconds) {
+        final long intervalNanos = 1_000_000_000L / targetTps;
+
+        final long startTime = System.nanoTime();
+        final long endTime = startTime + durationSeconds * 1_000_000_000L;
+
+        long nextSendTime = startTime;
+
+        while (System.nanoTime() < endTime) {
+            long now = System.nanoTime();
+
+            if (now < nextSendTime) {
+                LockSupport.parkNanos(nextSendTime - now);
+                continue;
+            }
+
             sendMessage();
+            nextSendTime += intervalNanos;
 
-            // TODO: send_start -> ack_received latency 기록
-            // Starvation 판정 기준: p95 >= 50ms, p99 >= 200ms
-
-            Thread.sleep(SEND_INTERVAL_MS);
+            long after = System.nanoTime();
+            if (after - nextSendTime > 1_000_000_000L) {
+                nextSendTime = after;
+            }
         }
+
+        producer.flush();
     }
 
     /**
@@ -86,14 +107,34 @@ public class LightProducer implements AutoCloseable {
         long seq = sequenceNumber.incrementAndGet();
         long timestamp = System.currentTimeMillis();
 
-        String key = String.format("%s-%d-%d", clientId, timestamp, seq);
+        String requestId = String.format("%s-%d-%d", clientId, timestamp, seq);
         String value = generatePayload(MESSAGE_SIZE_BYTES);
 
-        ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, key, value);
+        ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, requestId, value);
+
+        long start=System.nanoTime();
+        startNanos.put(requestId, start);
+        logger.logStage(clientId, "send_start", requestId);
 
         producer.send(record, (metadata, exception) -> {
+            long end=System.nanoTime();
+            Long st=startNanos.remove(requestId);
+
             if (exception != null) {
+                logger.logStage(clientId, "ack_error", requestId);
                 exception.printStackTrace();
+                return;
+            }
+
+            long prevAck=lastAckNanos.getAndSet(end);
+            if(prevAck>0){
+                logger.logLatency(clientId, "service_gap", requestId, prevAck, end);
+            }
+
+            if (st != null) {
+                logger.logLatency(clientId, "ack_received", requestId, st, end);
+            }else{
+                logger.logStage(clientId, "ack_received", requestId);
             }
         });
     }
@@ -104,6 +145,11 @@ public class LightProducer implements AutoCloseable {
 
     @Override
     public void close() {
-        producer.close();
+        try{
+            producer.flush();
+        }finally {
+            producer.close();
+            logger.close();
+        }
     }
 }
