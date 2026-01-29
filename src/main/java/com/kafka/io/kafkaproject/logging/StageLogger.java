@@ -1,8 +1,11 @@
 package com.kafka.io.kafkaproject.logging;
 
+import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -42,10 +45,28 @@ public class StageLogger {
 
     private final PrintWriter writer;
 
-    public StageLogger(String filePath) throws IOException {
-        this.writer = new PrintWriter(new FileWriter(filePath, true));
-        // 헤더 출력
-        writer.println("# ts|thread|clientId|stage|requestId|latency_ms");
+
+    /**
+     * 클라이언트별 StageLogger 생성자
+     *
+     * @param scenarioId 실험 시나리오 ID (e.g., S1, S2)
+     * @param clientId   클라이언트 ID (e.g., heavy-producer-1)
+     */
+    public StageLogger(String scenarioId, String clientId) throws IOException {
+        // results/{scenarioId} 디렉토리 생성
+        Path dirPath=Path.of("results", scenarioId);
+        Files.createDirectories(dirPath);
+
+        // results/{scenarioId}/{clientId}.log
+        File logFile=dirPath.resolve(clientId+".log").toFile();
+        boolean isNewFile=!logFile.exists();
+        this.writer = new PrintWriter(new FileWriter(logFile, true));
+
+        // 파일 최초 생성 시에만 헤더 출력
+        if (isNewFile) {
+            writer.println("# ts|thread|clientId|stage|requestId|latency_ms");
+            writer.flush();
+        }
     }
 
     /**
@@ -56,12 +77,16 @@ public class StageLogger {
      * @param requestId 요청 ID (correlationId 또는 메시지 key)
      * @param latencyMs 소요 시간 (ms), 해당 없으면 0
      */
-    public void log(String clientId, String stage, String requestId, double latencyMs) {
+    public synchronized void log(String clientId, String stage, String requestId, double latencyMs) {
         String timestamp = TIMESTAMP_FORMAT.format(Instant.now());
-        String threadName = Thread.currentThread().getName();
+
+        String threadName = sanitize(Thread.currentThread().getName());
+        String safeClientId = sanitize(clientId);
+        String safeStage = sanitize(stage);
+        String safeRequestId = sanitize(requestId);
 
         String logLine = String.format("%s|%s|%s|%s|%s|%.3f",
-                timestamp, threadName, clientId, stage, requestId, latencyMs);
+                timestamp, threadName, safeClientId, safeStage, safeRequestId, latencyMs);
 
         writer.println(logLine);
         writer.flush();
@@ -71,7 +96,7 @@ public class StageLogger {
      * 브로커 측 로그 (latency 없이)
      */
     public void logStage(String clientId, String stage, String requestId) {
-        log(clientId, stage, requestId, 0.0);
+        log(clientId, stage, requestId, -1.0);
     }
 
     /**
@@ -83,21 +108,16 @@ public class StageLogger {
         log(clientId, stage, requestId, latencyMs);
     }
 
-    public void close() {
-        writer.close();
+    private String sanitize(String s) {
+        if (s == null) return "";
+        // Prevent delimiter/newline injection that would break log parsing
+        return s.replace("|", "/")
+                .replace("\n", " ")
+                .replace("\r", " ");
     }
 
-    // Singleton for convenience
-    private static StageLogger instance;
 
-    public static synchronized StageLogger getInstance() {
-        if (instance == null) {
-            try {
-                instance = new StageLogger("results/stage-log.csv");
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create StageLogger", e);
-            }
-        }
-        return instance;
+    public void close() {
+        writer.close();
     }
 }

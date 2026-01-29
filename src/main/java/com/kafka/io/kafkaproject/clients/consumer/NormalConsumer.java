@@ -1,10 +1,12 @@
 package com.kafka.io.kafkaproject.clients.consumer;
 
+import com.kafka.io.kafkaproject.logging.StageLogger;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
@@ -32,11 +34,14 @@ public class NormalConsumer implements AutoCloseable {
 
     private final KafkaConsumer<String, String> consumer;
     private final String clientId;
+    private final StageLogger logger;
+
     private volatile boolean running = true;
 
-    public NormalConsumer(String bootstrapServers, String groupId, int consumerId) {
+    public NormalConsumer(String scenarioId, String bootstrapServers, String groupId, int consumerId) throws IOException {
         this.clientId = "normal-consumer-" + consumerId;
         this.consumer = createConsumer(bootstrapServers, groupId);
+        this.logger=new StageLogger(scenarioId, clientId);
     }
 
     private KafkaConsumer<String, String> createConsumer(String bootstrapServers, String groupId) {
@@ -64,19 +69,26 @@ public class NormalConsumer implements AutoCloseable {
 
         while (running) {
             long pollStart = System.nanoTime();
+            logger.logStage(clientId, "poll_start","-");
 
             ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+            long pollEnd= System.nanoTime();
 
-            long fetchReceived = System.nanoTime();
+            if(records.isEmpty()){
+                logger.logLatency(clientId, "poll_timeout", "-", pollStart, pollEnd);
+                continue;
+            }
+
+            logger.logLatency(clientId, "fetch_received","-", pollStart, pollEnd);
 
             // 즉시 처리 (지연 없음)
             records.forEach(record -> {
-                // TODO: 메시지 처리 및 로깅
             });
 
             long processDone = System.nanoTime();
 
             // TODO: 로깅
+            logger.logLatency(clientId, "process_done","-", pollEnd, processDone);
         }
     }
 
@@ -86,6 +98,11 @@ public class NormalConsumer implements AutoCloseable {
 
     @Override
     public void close() {
-        consumer.close();
+        try{
+            consumer.close();
+        }finally {
+            logger.close();
+        }
+
     }
 }
