@@ -1,0 +1,107 @@
+diff --git a/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java b/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
+index e9c3dff..d43638a 100644
+--- a/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
++++ b/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
+@@ -38,6 +38,7 @@ import static org.apache.kafka.common.config.ConfigDef.Importance.HIGH;
+ import static org.apache.kafka.common.config.ConfigDef.Importance.LOW;
+ import static org.apache.kafka.common.config.ConfigDef.Importance.MEDIUM;
+ import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
++import static org.apache.kafka.common.config.ConfigDef.Type.BOOLEAN;
+ import static org.apache.kafka.common.config.ConfigDef.Type.INT;
+ import static org.apache.kafka.common.config.ConfigDef.Type.LONG;
+ import static org.apache.kafka.common.config.ConfigDef.Type.STRING;
+@@ -154,6 +155,36 @@ public class SocketServerConfigs {
+     public static final int NUM_NETWORK_THREADS_DEFAULT = 3;
+     public static final String NUM_NETWORK_THREADS_DOC = "The number of threads that the server uses for receiving requests from the network and sending responses to the network. Noted: each listener (except for controller listener) creates its own thread pool.";
+ 
++    public static final String SOCKET_READ_SCHEDULING_POLICY_CONFIG = "socket.read.scheduling.policy";
++    public static final String SOCKET_READ_SCHEDULING_POLICY_DEFAULT = "default";
++    public static final String SOCKET_READ_SCHEDULING_POLICY_DOC =
++            "Read scheduling policy for socket selector. Supported values are <code>default</code>, " +
++                    "<code>shuffle</code> and <code>drr</code>.";
++
++    public static final String SOCKET_READ_SCHEDULING_DRR_QUANTUM_CONFIG = "socket.read.scheduling.drr.quantum";
++    public static final long SOCKET_READ_SCHEDULING_DRR_QUANTUM_DEFAULT = 1L;
++    public static final String SOCKET_READ_SCHEDULING_DRR_QUANTUM_DOC =
++            "Deficit quantum added per connection on each selector poll when " +
++                    "<code>socket.read.scheduling.policy=drr</code>.";
++
++    public static final String SOCKET_READ_SCHEDULING_DRR_MIN_COST_CONFIG = "socket.read.scheduling.drr.min.cost";
++    public static final long SOCKET_READ_SCHEDULING_DRR_MIN_COST_DEFAULT = 1L;
++    public static final String SOCKET_READ_SCHEDULING_DRR_MIN_COST_DOC =
++            "Minimum read cost charged by DRR. This is used as the minimum estimated cost and minimum charged cost " +
++                    "when bytes-based DRR cost is enabled.";
++
++    public static final String SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG = "socket.read.scheduling.drr.max.deficit";
++    public static final long SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DEFAULT = 8L;
++    public static final String SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DOC =
++            "Maximum absolute deficit bound per connection used by DRR.";
++
++    public static final String SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG =
++            "socket.read.scheduling.drr.enable.bytes.cost";
++    public static final boolean SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DEFAULT = false;
++    public static final String SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DOC =
++            "If true, DRR charges read cost based on bytes read (with minimum cost). If false, DRR charges a fixed " +
++                    "cost of 1 per read attempt.";
++
+     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
+             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
+             .define(ADVERTISED_LISTENERS_CONFIG, STRING, null, HIGH, ADVERTISED_LISTENERS_DOC)
+@@ -170,7 +201,18 @@ public class SocketServerConfigs {
+             .define(FAILED_AUTHENTICATION_DELAY_MS_CONFIG, INT, FAILED_AUTHENTICATION_DELAY_MS_DEFAULT, atLeast(0), LOW, FAILED_AUTHENTICATION_DELAY_MS_DOC)
+             .define(QUEUED_MAX_REQUESTS_CONFIG, INT, QUEUED_MAX_REQUESTS_DEFAULT, atLeast(1), HIGH, QUEUED_MAX_REQUESTS_DOC)
+             .define(QUEUED_MAX_BYTES_CONFIG, LONG, QUEUED_MAX_REQUEST_BYTES_DEFAULT, MEDIUM, QUEUED_MAX_REQUEST_BYTES_DOC)
+-            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC);
++            .define(NUM_NETWORK_THREADS_CONFIG, INT, NUM_NETWORK_THREADS_DEFAULT, atLeast(1), HIGH, NUM_NETWORK_THREADS_DOC)
++            .define(SOCKET_READ_SCHEDULING_POLICY_CONFIG, STRING, SOCKET_READ_SCHEDULING_POLICY_DEFAULT,
++                    ConfigDef.ValidString.in("default", "shuffle", "drr"), MEDIUM, SOCKET_READ_SCHEDULING_POLICY_DOC)
++            .define(SOCKET_READ_SCHEDULING_DRR_QUANTUM_CONFIG, LONG, SOCKET_READ_SCHEDULING_DRR_QUANTUM_DEFAULT,
++                    atLeast(1), MEDIUM, SOCKET_READ_SCHEDULING_DRR_QUANTUM_DOC)
++            .define(SOCKET_READ_SCHEDULING_DRR_MIN_COST_CONFIG, LONG, SOCKET_READ_SCHEDULING_DRR_MIN_COST_DEFAULT,
++                    atLeast(1), MEDIUM, SOCKET_READ_SCHEDULING_DRR_MIN_COST_DOC)
++            .define(SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG, LONG, SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DEFAULT,
++                    atLeast(1), MEDIUM, SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DOC)
++            .define(SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG, BOOLEAN,
++                    SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DEFAULT, MEDIUM,
++                    SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DOC);
+ 
+     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
+         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
+diff --git a/core/src/main/scala/kafka/server/KafkaConfig.scala b/core/src/main/scala/kafka/server/KafkaConfig.scala
+index 67c6feb..69a1d27 100755
+--- a/core/src/main/scala/kafka/server/KafkaConfig.scala
++++ b/core/src/main/scala/kafka/server/KafkaConfig.scala
+@@ -304,6 +304,11 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
+   val queuedMaxRequests = getInt(SocketServerConfigs.QUEUED_MAX_REQUESTS_CONFIG)
+   val queuedMaxBytes = getLong(SocketServerConfigs.QUEUED_MAX_BYTES_CONFIG)
+   def numNetworkThreads = getInt(SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG)
++  val socketReadSchedulingPolicy = getString(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG)
++  val socketReadSchedulingDrrQuantum = getLong(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_QUANTUM_CONFIG)
++  val socketReadSchedulingDrrMinCost = getLong(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MIN_COST_CONFIG)
++  val socketReadSchedulingDrrMaxDeficit = getLong(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG)
++  val socketReadSchedulingDrrEnableBytesCost = getBoolean(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG)
+ 
+   /***************** rack configuration **************/
+   val rack = Option(getString(ServerConfigs.BROKER_RACK_CONFIG))
+diff --git a/core/src/main/scala/kafka/network/SocketServer.scala b/core/src/main/scala/kafka/network/SocketServer.scala
+index 884c000..c43d7c9 100644
+--- a/core/src/main/scala/kafka/network/SocketServer.scala
++++ b/core/src/main/scala/kafka/network/SocketServer.scala
+@@ -895,7 +895,16 @@ private[kafka] class Processor(
+       true,
+       channelBuilder,
+       memoryPool,
+-      logContext)
++      logContext,
++      new KSelector.ReadSchedulingConfig(
++        KSelector.HandlingOrderPolicy.forName(config.socketReadSchedulingPolicy),
++        new KSelector.DrrConfig(
++          config.socketReadSchedulingDrrQuantum,
++          config.socketReadSchedulingDrrMinCost,
++          config.socketReadSchedulingDrrMaxDeficit,
++          config.socketReadSchedulingDrrEnableBytesCost
++        )
++      ))
+   }
+ 
+   // Connection ids have the format `localAddr:localPort-remoteAddr:remotePort-index`. The index is a
