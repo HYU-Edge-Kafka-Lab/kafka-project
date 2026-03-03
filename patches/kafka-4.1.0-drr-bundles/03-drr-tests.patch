@@ -1,0 +1,112 @@
+diff --git a/clients/src/test/java/org/apache/kafka/common/network/SelectorSchedulingPolicyTest.java b/clients/src/test/java/org/apache/kafka/common/network/SelectorSchedulingPolicyTest.java
+new file mode 100644
+index 0000000..c983c1b
+--- /dev/null
++++ b/clients/src/test/java/org/apache/kafka/common/network/SelectorSchedulingPolicyTest.java
+@@ -0,0 +1,46 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.kafka.common.network;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++class SelectorSchedulingPolicyTest {
++
++    @Test
++    void testHandlingOrderPolicyForName() {
++        assertEquals(Selector.HandlingOrderPolicy.DEFAULT, Selector.HandlingOrderPolicy.forName(null));
++        assertEquals(Selector.HandlingOrderPolicy.DEFAULT, Selector.HandlingOrderPolicy.forName("default"));
++        assertEquals(Selector.HandlingOrderPolicy.SHUFFLE, Selector.HandlingOrderPolicy.forName("shuffle"));
++        assertEquals(Selector.HandlingOrderPolicy.DRR, Selector.HandlingOrderPolicy.forName("drr"));
++        assertEquals(Selector.HandlingOrderPolicy.DRR, Selector.HandlingOrderPolicy.forName("DRR"));
++    }
++
++    @Test
++    void testHandlingOrderPolicyForNameUnknownValue() {
++        assertThrows(IllegalArgumentException.class, () -> Selector.HandlingOrderPolicy.forName("unknown"));
++    }
++
++    @Test
++    void testDrrConfigValidation() {
++        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(0, 1, 1, false));
++        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(1, 0, 1, false));
++        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(1, 1, 0, false));
++    }
++}
+diff --git a/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java b/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
+index be4184a..f87dd83 100644
+--- a/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
++++ b/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
+@@ -17,6 +17,7 @@
+ package org.apache.kafka.network;
+ 
+ import org.apache.kafka.common.Endpoint;
++import org.apache.kafka.common.config.ConfigException;
+ import org.apache.kafka.common.network.ListenerName;
+ import org.apache.kafka.common.security.auth.SecurityProtocol;
+ 
+@@ -26,6 +27,7 @@ import java.util.List;
+ import java.util.Map;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
+ 
+ public class SocketServerConfigsTest {
+     @Test
+@@ -97,4 +99,39 @@ public class SocketServerConfigsTest {
+                 SocketServerConfigs.listenerListToEndPoints("CONTROLLER://example.com:9093",
+                     Map.of(new ListenerName("CONTROLLER"), SecurityProtocol.PLAINTEXT)));
+     }
++
++    @Test
++    public void testReadSchedulingConfigDefaults() {
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG).defaultValue
++        );
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_QUANTUM_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_QUANTUM_CONFIG).defaultValue
++        );
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MIN_COST_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MIN_COST_CONFIG).defaultValue
++        );
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG).defaultValue
++        );
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(
++                        SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG).defaultValue
++        );
++    }
++
++    @Test
++    public void testReadSchedulingPolicyConfigValidation() {
++        assertEquals("drr",
++                SocketServerConfigs.CONFIG_DEF.parse(
++                        Map.of(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG, "drr"))
++                        .get(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG));
++        assertThrows(ConfigException.class, () -> SocketServerConfigs.CONFIG_DEF.parse(
++                Map.of(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG, "unknown-policy")));
++    }
+ }

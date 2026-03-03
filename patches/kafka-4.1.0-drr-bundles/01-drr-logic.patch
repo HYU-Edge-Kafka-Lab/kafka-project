@@ -1,0 +1,314 @@
+diff --git a/clients/src/main/java/org/apache/kafka/common/network/Selector.java b/clients/src/main/java/org/apache/kafka/common/network/Selector.java
+index 151a0fb..7cb635b 100644
+--- a/clients/src/main/java/org/apache/kafka/common/network/Selector.java
++++ b/clients/src/main/java/org/apache/kafka/common/network/Selector.java
+@@ -50,6 +50,7 @@ import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
+@@ -90,6 +91,99 @@ public class Selector implements Selectable, AutoCloseable {
+     public static final long NO_IDLE_TIMEOUT_MS = -1;
+     public static final int NO_FAILED_AUTHENTICATION_DELAY = 0;
+ 
++    public enum HandlingOrderPolicy {
++        DEFAULT,
++        SHUFFLE,
++        DRR;
++
++        public static HandlingOrderPolicy forName(String value) {
++            if (value == null) {
++                return DEFAULT;
++            }
++            String normalizedValue = value.trim().toLowerCase(Locale.ROOT);
++            switch (normalizedValue) {
++                case "default":
++                    return DEFAULT;
++                case "shuffle":
++                    return SHUFFLE;
++                case "drr":
++                    return DRR;
++                default:
++                    throw new IllegalArgumentException("Unknown selector handling order policy " + value);
++            }
++        }
++    }
++
++    public static final class DrrConfig {
++        private static final long DEFAULT_QUANTUM = 1L;
++        private static final long DEFAULT_MIN_COST = 1L;
++        private static final long DEFAULT_MAX_DEFICIT = 8L;
++        private static final boolean DEFAULT_ENABLE_BYTES_COST = false;
++
++        private final long quantum;
++        private final long minCost;
++        private final long maxDeficit;
++        private final boolean enableBytesCost;
++
++        public DrrConfig(long quantum, long minCost, long maxDeficit, boolean enableBytesCost) {
++            if (quantum <= 0) {
++                throw new IllegalArgumentException("DRR quantum must be positive.");
++            }
++            if (minCost <= 0) {
++                throw new IllegalArgumentException("DRR minimum cost must be positive.");
++            }
++            if (maxDeficit <= 0) {
++                throw new IllegalArgumentException("DRR max deficit must be positive.");
++            }
++            this.quantum = quantum;
++            this.minCost = minCost;
++            this.maxDeficit = maxDeficit;
++            this.enableBytesCost = enableBytesCost;
++        }
++
++        public long quantum() {
++            return quantum;
++        }
++
++        public long minCost() {
++            return minCost;
++        }
++
++        public long maxDeficit() {
++            return maxDeficit;
++        }
++
++        public boolean enableBytesCost() {
++            return enableBytesCost;
++        }
++
++        public static DrrConfig defaultConfig() {
++            return new DrrConfig(DEFAULT_QUANTUM, DEFAULT_MIN_COST, DEFAULT_MAX_DEFICIT, DEFAULT_ENABLE_BYTES_COST);
++        }
++    }
++
++    public static final class ReadSchedulingConfig {
++        private final HandlingOrderPolicy handlingOrderPolicy;
++        private final DrrConfig drrConfig;
++
++        public ReadSchedulingConfig(HandlingOrderPolicy handlingOrderPolicy, DrrConfig drrConfig) {
++            this.handlingOrderPolicy = handlingOrderPolicy == null ? HandlingOrderPolicy.DEFAULT : handlingOrderPolicy;
++            this.drrConfig = drrConfig == null ? DrrConfig.defaultConfig() : drrConfig;
++        }
++
++        public HandlingOrderPolicy handlingOrderPolicy() {
++            return handlingOrderPolicy;
++        }
++
++        public DrrConfig drrConfig() {
++            return drrConfig;
++        }
++
++        public static ReadSchedulingConfig defaultConfig() {
++            return new ReadSchedulingConfig(HandlingOrderPolicy.DEFAULT, DrrConfig.defaultConfig());
++        }
++    }
++
+     private enum CloseMode {
+         GRACEFUL(true),            // process outstanding buffered receives, notify disconnect
+         NOTIFY_ONLY(true),         // discard any outstanding receives, notify disconnect
+@@ -125,6 +219,9 @@ public class Selector implements Selectable, AutoCloseable {
+     private final MemoryPool memoryPool;
+     private final long lowMemThreshold;
+     private final int failedAuthenticationDelayMs;
++    private final HandlingOrderPolicy handlingOrderPolicy;
++    private final DrrConfig drrConfig;
++    private final Map<String, Long> drrDeficits;
+ 
+     //indicates if the previous call to poll was able to make progress in reading already-buffered data.
+     //this is used to prevent tight loops when memory is not available to read any more data
+@@ -156,6 +253,24 @@ public class Selector implements Selectable, AutoCloseable {
+             ChannelBuilder channelBuilder,
+             MemoryPool memoryPool,
+             LogContext logContext) {
++        this(maxReceiveSize, connectionMaxIdleMs, failedAuthenticationDelayMs, metrics, time, metricGrpPrefix, metricTags,
++            metricsPerConnection, recordTimePerConnection, channelBuilder, memoryPool, logContext,
++            ReadSchedulingConfig.defaultConfig());
++    }
++
++    public Selector(int maxReceiveSize,
++                    long connectionMaxIdleMs,
++                    int failedAuthenticationDelayMs,
++                    Metrics metrics,
++                    Time time,
++                    String metricGrpPrefix,
++                    Map<String, String> metricTags,
++                    boolean metricsPerConnection,
++                    boolean recordTimePerConnection,
++                    ChannelBuilder channelBuilder,
++                    MemoryPool memoryPool,
++                    LogContext logContext,
++                    ReadSchedulingConfig readSchedulingConfig) {
+         try {
+             this.nioSelector = java.nio.channels.Selector.open();
+         } catch (IOException e) {
+@@ -182,6 +297,11 @@ public class Selector implements Selectable, AutoCloseable {
+         this.memoryPool = memoryPool;
+         this.lowMemThreshold = (long) (0.1 * this.memoryPool.size());
+         this.failedAuthenticationDelayMs = failedAuthenticationDelayMs;
++        ReadSchedulingConfig effectiveReadSchedulingConfig =
++            readSchedulingConfig == null ? ReadSchedulingConfig.defaultConfig() : readSchedulingConfig;
++        this.handlingOrderPolicy = effectiveReadSchedulingConfig.handlingOrderPolicy();
++        this.drrConfig = effectiveReadSchedulingConfig.drrConfig();
++        this.drrDeficits = this.handlingOrderPolicy == HandlingOrderPolicy.DRR ? new HashMap<>() : Collections.emptyMap();
+         this.delayedClosingChannels = (failedAuthenticationDelayMs > NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap<>() : null;
+     }
+ 
+@@ -472,6 +592,7 @@ public class Selector implements Selectable, AutoCloseable {
+         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds(), false);
+ 
+         if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
++            replenishDrrDeficits();
+             Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
+ 
+             // Poll from channels that have buffered data (but nothing more from the underlying socket)
+@@ -577,8 +698,9 @@ public class Selector implements Selectable, AutoCloseable {
+                 //if channel is ready and has bytes to read from socket or buffer, and has no
+                 //previous completed receive then read from it
+                 if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
+-                        && !explicitlyMutedChannels.contains(channel)) {
+-                    attemptRead(channel);
++                        && !explicitlyMutedChannels.contains(channel) && canReadWithDrrBudget(channel)) {
++                    long bytesRead = attemptRead(channel);
++                    consumeDrrBudget(channel, bytesRead);
+                 }
+ 
+                 if (channel.hasBytesBuffered() && !explicitlyMutedChannels.contains(channel)) {
+@@ -664,16 +786,24 @@ public class Selector implements Selectable, AutoCloseable {
+     private Collection<SelectionKey> determineHandlingOrder(Set<SelectionKey> selectionKeys) {
+         //it is possible that the iteration order over selectionKeys is the same every invocation.
+         //this may cause starvation of reads when memory is low. to address this we shuffle the keys if memory is low.
++        if (handlingOrderPolicy == HandlingOrderPolicy.SHUFFLE) {
++            return shuffledSelectionKeys(selectionKeys);
++        }
++
+         if (!outOfMemory && memoryPool.availableMemory() < lowMemThreshold) {
+-            List<SelectionKey> shuffledKeys = new ArrayList<>(selectionKeys);
+-            Collections.shuffle(shuffledKeys);
+-            return shuffledKeys;
+-        } else {
+-            return selectionKeys;
++            return shuffledSelectionKeys(selectionKeys);
+         }
++
++        return selectionKeys;
++    }
++
++    private List<SelectionKey> shuffledSelectionKeys(Set<SelectionKey> selectionKeys) {
++        List<SelectionKey> shuffledKeys = new ArrayList<>(selectionKeys);
++        Collections.shuffle(shuffledKeys);
++        return shuffledKeys;
+     }
+ 
+-    private void attemptRead(KafkaChannel channel) throws IOException {
++    private long attemptRead(KafkaChannel channel) throws IOException {
+         String nodeId = channel.id();
+ 
+         long bytesReceived = channel.read();
+@@ -692,6 +822,7 @@ public class Selector implements Selectable, AutoCloseable {
+         } else {
+             madeReadProgressLastPoll = true;
+         }
++        return bytesReceived;
+     }
+ 
+     private boolean maybeReadFromClosingChannel(KafkaChannel channel) {
+@@ -718,6 +849,87 @@ public class Selector implements Selectable, AutoCloseable {
+             channel.addNetworkThreadTimeNanos(time.nanoseconds() - startTimeNanos);
+     }
+ 
++    private boolean isDrrEnabled() {
++        return handlingOrderPolicy == HandlingOrderPolicy.DRR;
++    }
++
++    private void replenishDrrDeficits() {
++        if (!isDrrEnabled()) {
++            return;
++        }
++        for (KafkaChannel channel : channels.values()) {
++            String connectionId = channel.id();
++            long currentDeficit = drrDeficits.getOrDefault(connectionId, 0L);
++            long updatedDeficit = saturatingAdd(currentDeficit, drrConfig.quantum());
++            drrDeficits.put(connectionId, boundedDeficit(updatedDeficit));
++        }
++    }
++
++    private boolean canReadWithDrrBudget(KafkaChannel channel) {
++        if (!isDrrEnabled()) {
++            return true;
++        }
++        long deficit = drrDeficits.getOrDefault(channel.id(), 0L);
++        return deficit >= estimatedDrrCost();
++    }
++
++    private void consumeDrrBudget(KafkaChannel channel, long bytesRead) {
++        if (!isDrrEnabled()) {
++            return;
++        }
++        long cost = drrCost(bytesRead);
++        if (cost <= 0) {
++            return;
++        }
++        long currentDeficit = drrDeficits.getOrDefault(channel.id(), 0L);
++        drrDeficits.put(channel.id(), boundedDeficit(currentDeficit - cost));
++    }
++
++    private long estimatedDrrCost() {
++        if (!drrConfig.enableBytesCost()) {
++            return 1L;
++        }
++        return drrConfig.minCost();
++    }
++
++    private long drrCost(long bytesRead) {
++        if (!drrConfig.enableBytesCost()) {
++            return 1L;
++        }
++        if (bytesRead <= 0) {
++            return 0L;
++        }
++        return Math.max(bytesRead, drrConfig.minCost());
++    }
++
++    private long boundedDeficit(long deficit) {
++        long minDeficit = -drrConfig.maxDeficit();
++        long maxDeficit = drrConfig.maxDeficit();
++        if (deficit < minDeficit) {
++            return minDeficit;
++        }
++        if (deficit > maxDeficit) {
++            return maxDeficit;
++        }
++        return deficit;
++    }
++
++    private long saturatingAdd(long left, long right) {
++        if (right > 0 && left > Long.MAX_VALUE - right) {
++            return Long.MAX_VALUE;
++        }
++        if (right < 0 && left < Long.MIN_VALUE - right) {
++            return Long.MIN_VALUE;
++        }
++        return left + right;
++    }
++
++    private void clearDrrDeficit(String connectionId) {
++        if (isDrrEnabled()) {
++            drrDeficits.remove(connectionId);
++        }
++    }
++
+     @Override
+     public List<NetworkSend> completedSends() {
+         return this.completedSends;
+@@ -968,6 +1180,7 @@ public class Selector implements Selectable, AutoCloseable {
+ 
+         this.sensors.connectionClosed.record();
+         this.explicitlyMutedChannels.remove(channel);
++        clearDrrDeficit(channel.id());
+         if (notifyDisconnect)
+             this.disconnected.put(channel.id(), channel.state());
+     }
