@@ -1,5 +1,5 @@
-scenario,clientID,stage,samples,p95_ms,p99_ms,max_ms
-S1,heavy-producer-1,ack_received,130795,2467.442,3040.024,3336.689
-S1,light-producer-1,ack_received,5478,6.936,12.871,80.501
-S1,heavy-producer-1,service_gap,130795,2.851,5.651,90.302
-S1,light-producer-1,service_gap,5478,13.926,17.326,88.963
+scenario,clientID,stage,samples,mean_ms,p0_ms,p10_ms,p20_ms,p30_ms,p40_ms,p50_ms,p60_ms,p70_ms,p80_ms,p90_ms,p95_ms,p99_ms,p100_ms
+S1,heavy-producer-1,ack_received,260042,1338.718,41.923,1031.130,1086.925,1140.353,1207.569,1269.987,1341.400,1417.532,1515.521,1722.143,2076.897,2497.797,2958.486
+S1,light-producer-1,ack_received,114767,8.420,0.312,1.203,1.982,2.993,4.382,6.002,7.873,10.136,13.182,18.344,24.284,41.798,229.076
+S1,heavy-producer-1,service_gap,260041,0.446,0.010,0.020,0.021,0.022,0.024,0.025,0.029,0.037,0.077,1.767,3.061,5.790,84.749
+S1,light-producer-1,service_gap,114766,0.998,0.011,0.019,0.026,0.044,0.095,0.318,0.726,1.193,1.792,2.727,3.742,6.827,107.239
