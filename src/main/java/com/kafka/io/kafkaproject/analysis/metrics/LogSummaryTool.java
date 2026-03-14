@@ -12,17 +12,25 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 /**
- * results/{scenarioId}/*.log 를 읽어 stage별 latency(p95/p99/max)를 summary.csv로 저장
- *
+ * results/{scenarioId}/*.log 파일을 읽어 stage별 latency 통계를 summary.csv로 저장한다.
  * 로그 포맷:
  * ts|thread|clientId|stage|requestId|latency_ms
  *
- * 출력 CSV(ROW 방식):
- * scenario,clientId,stage,samples,p95_ms,p99_ms,max_ms
+ * 측정 대상 stage 예시:
+ * - ack_received : Producer가 send_start 이후 ACK를 수신하기까지의 latency
+ * - service_gap  : 동일 connection에서 연속된 ACK 사이의 시간 간격
+ * - fetch_received / process_done / poll_timeout : Consumer 측 측정 stage
  *
+ * 출력 CSV(ROW 방식):
+ * scenario,clientID,stage,samples,mean_ms,p0_ms,p10_ms,p20_ms,p30_ms,p40_ms,p50_ms,p60_ms,p70_ms,p80_ms,p90_ms,p95_ms,p99_ms,p100_ms
+ *
+ * percentile은 mean, p50(중앙값), p90, p95, p99, p100(max)를 포함하며,
+ * p0~p100 구간값(10% 단위)도 함께 저장한다.
+
  * 사용 예시(인텔리J에서 main 실행 + args):
- *   S0 ack_received --warmupSec 5
- *   S1 ack_received --warmupSec 5
+ *   S0 ack_received service_gap --warmupSec 5
+ *   S1 ack_received service_gap --warmupSec 5
+ *   S1N_L5_T1000 ack_received service_gap --warmupSec 5
  *   S0 fetch_received process_done poll_timeout --warmupSec 5
  */
 public class LogSummaryTool {
@@ -36,8 +44,9 @@ public class LogSummaryTool {
                       <scenarioId> <stage1> [stage2 ...] [--warmupSec N] [--out summary.csv]
 
                     Example:
-                      S0 ack_received --warmupSec 5
-                      S1 ack_received --warmupSec 5
+                      S0 ack_received service_gap --warmupSec 5
+                      S1 ack_received service_gap --warmupSec 5
+                      S1N_L5_T1000 ack_received service_gap --warmupSec 5
                     """);
             return;
         }
@@ -143,9 +152,11 @@ public class LogSummaryTool {
     )throws IOException {
         boolean writeHeader=!Files.exists(out)||Files.size(out)==0;
         try(BufferedWriter bw=Files.newBufferedWriter(out,
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE)) {
                 if(writeHeader) {
-                    bw.write("scenario,clientID,stage,samples,p95_ms,p99_ms,max_ms\n");
+                    bw.write("scenario,clientID,stage,samples,mean_ms,p0_ms,p10_ms,p20_ms,p30_ms,p40_ms,p50_ms,p60_ms,p70_ms,p80_ms,p90_ms,p95_ms,p99_ms,p100_ms\n");
                 }
 
             for(String stage: stages) {
@@ -155,22 +166,37 @@ public class LogSummaryTool {
 
                     if (list.isEmpty()) {
                         bw.write(String.format(Locale.US,
-                                "%s,%s,%s,%d,,,\n",
+                                "%s,%s,%s,%d,,,,,,,,,,,,,,,,,\n",
                                 scenarioId, clientId, stage, 0));
                         continue;
                     }
 
-                    List<Double> sorted=new ArrayList<>(list);
+                    List<Double> sorted = new ArrayList<>(list);
                     Collections.sort(sorted);
 
                     int n= sorted.size();
+                    double sum=0.0;
+                    for(double v: sorted) {sum+=v;}
+                    double mean=sum/n;
+
+                    double p0=percentile(sorted,0.00);
+                    double p10=percentile(sorted,0.10);
+                    double p20=percentile(sorted,0.20);
+                    double p30=percentile(sorted,0.30);
+                    double p40=percentile(sorted,0.40);
+                    double p50=percentile(sorted,0.50);
+                    double p60=percentile(sorted,0.60);
+                    double p70=percentile(sorted,0.70);
+                    double p80=percentile(sorted,0.80);
+                    double p90=percentile(sorted,0.90);
                     double p95=percentile(sorted, 0.95);
                     double p99=percentile(sorted,0.99);
-                    double max=sorted.get(n-1);
+                    double p100=percentile(sorted,1.00);
 
                     bw.write(String.format(Locale.US,
-                            "%s,%s,%s,%d,%.3f,%.3f,%.3f\n",
-                            scenarioId, clientId, stage, n, p95, p99, max));
+                            "%s,%s,%s,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                            scenarioId, clientId, stage, n,
+                            mean, p0, p10, p20, p30, p40, p50, p60, p70, p80, p90, p95, p99, p100));
                 }
             }
         }

@@ -12,21 +12,23 @@ import java.util.List;
 import java.util.Properties;
 
 /**
- * Normal Consumer - 정상 속도 소비 클라이언트
+ * Normal Consumer - 실험 보조 소비자
  *
- * 설정 (KICKOFF.md 6.4절):
  * - clientId: normal-consumer-{N}
  * - max.poll.records: 500
  * - fetch.min.bytes: 1
  * - fetch.max.wait.ms: 500
- * - 처리 지연: 없음
+ * - 처리 지연: 없음 (baseline consumer)
  *
  * 역할:
- * - 정상 baseline 측정
- * - SlowConsumer와의 비교 대상
+ * - Producer 실험(S0, S1, S1N) 동안 토픽에 적재된 메시지를 지속적으로 소비
+ * - broker 내부 backlog가 과도하게 누적되는 것을 방지
+ * - Producer ACK 및 Service Gap 측정이 broker queue 적체의 영향을 받지 않도록 유지
  *
- * 사용 시나리오:
- * - S0: Balanced Load (대조군)
+ * 동작 방식:
+ * - poll → fetch_received → process_done 단계 로깅
+ * - 메시지 처리 로직 없이 즉시 소비
+ * - Consumer 처리 지연을 최소화하여 실험 환경을 안정적으로 유지
  */
 public class NormalConsumer implements AutoCloseable {
 
@@ -82,8 +84,9 @@ public class NormalConsumer implements AutoCloseable {
             logger.logLatency(clientId, "fetch_received","-", pollStart, pollEnd);
 
             // 즉시 처리 (지연 없음)
-            records.forEach(record -> {
-            });
+            for (var record : records) {
+                // no processing (baseline consumer)
+            }
 
             long processDone = System.nanoTime();
 

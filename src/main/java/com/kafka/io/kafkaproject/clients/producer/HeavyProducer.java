@@ -14,20 +14,26 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Heavy Producer - 고부하 연속 전송 클라이언트
+ * Heavy Producer - 고부하 지속 전송 Producer
  *
- * 설정 (KICKOFF.md 6.4절):
+ * Producer 주요 설정:
  * - clientId: heavy-producer-{N}
  * - acks: 1
  * - linger.ms: 0
  * - batch.size: 65536 (64KB)
  * - buffer.memory: 67108864 (64MB)
- * - 전송 빈도: 연속 전송 (max throughput)
  * - 메시지 크기: 10KB
+ * - 전송 방식: target TPS 기반 지속 전송
+ * - inflight limit: 3000
  *
  * 사용 시나리오:
- * - S0: Balanced Load (1,000 TPS, 대조군)
- * - S1: Heavy vs Light Producer (10000 TPS, 폭주)
+ * - S0: Heavy/Light 동일 부하 비교 (1000 TPS)
+ * - S1: Heavy 고부하 / Light 단일 connection 비교
+ * - S1N: Heavy 고부하 / 다중 Light connection 비교
+ *
+ * 역할:
+ * - 지속적으로 높은 부하를 생성하여 Broker에서 거의 항상 ready 상태에 가까운 connection을 구성
+ * - send_start, ack_received, service_gap 로그를 기록하여 ACK latency 및 connection 처리 간격 분석에 사용
  */
 public class HeavyProducer implements AutoCloseable {
 
@@ -39,6 +45,8 @@ public class HeavyProducer implements AutoCloseable {
     private final StageLogger logger;
 
     private final AtomicLong sequenceNumber = new AtomicLong(0);
+    private final AtomicLong sentCount=new AtomicLong(0);
+    private final AtomicLong ackCount=new AtomicLong(0);
 
     private final ConcurrentHashMap<String, Long> startNanos=new ConcurrentHashMap<>();
 
@@ -69,28 +77,27 @@ public class HeavyProducer implements AutoCloseable {
     }
 
     /**
-     * 연속 전송 실행
+     * target TPS에 맞추어 일정 시간 동안 메시지를 지속적으로 전송한다.
      *
-     * @param targetTps 목표 TPS (e.g., 10000)
+     * @param targetTps 목표 TPS
      * @param durationSeconds 실행 시간(초)
      */
     public void runContinuousSend(int targetTps, int durationSeconds) {
-        // TODO: 구현
-        // - targetTps에 맞춰 전송 속도 조절
-        // - 메시지 key: {clientId}-{timestamp}-{seq}
-        // - send_start timestamp 기록
+        sentCount.set(0);
+        ackCount.set(0);
+        lastAckNanos.set(-1L);
+        sequenceNumber.set(0);
+
         final long intervalNanos=1_000_000_000L/targetTps;
+        final long durationNanos=durationSeconds*1_000_000_000L;
 
-        final long startTime=System.nanoTime();
-        final long endTime=startTime+durationSeconds*1_000_000_000L;
-
-//        다음 send 예정 시각
-        long nextSendTime=startTime;
+        long experimentStart=System.nanoTime();
+        long endTime=experimentStart+durationNanos;
+        long nextSendTime=experimentStart;
 
         while(System.nanoTime()<endTime){
             long now=System.nanoTime();
 
-            // 아직 보낼 시간이 아니면 남은 시간만큼 기다린다
             if(now<nextSendTime){
                 LockSupport.parkNanos(nextSendTime-now);
                 continue;
@@ -105,6 +112,22 @@ public class HeavyProducer implements AutoCloseable {
                 nextSendTime = after;
             }
         }
+
+        producer.flush();
+
+        long experimentEnd=System.nanoTime();
+        double elapsedSec=(experimentEnd-experimentStart)/1_000_000_000.0;
+
+        long totalSent=sentCount.get();
+        long totalAcked=ackCount.get();
+
+        double observedSendTps=elapsedSec>0?totalSent/elapsedSec:0.0;
+        double observedAckTps=elapsedSec>0?totalAcked/elapsedSec:0.0;
+
+        System.out.printf(
+                "[HeavyProducer:%s] targetTPS=%d, duration=%ds, sent=%d, acked=%d, elapsed=%.3fs, observedSendTPS=%.2f, observedAckTPS=%.2f%n",
+                clientId, targetTps, durationSeconds, totalSent, totalAcked, elapsedSec, observedSendTps, observedAckTps
+        );
     }
 
     /**
@@ -116,12 +139,11 @@ public class HeavyProducer implements AutoCloseable {
         }catch(InterruptedException e){
             Thread.currentThread().interrupt();
             return;
-
         }
         long seq = sequenceNumber.incrementAndGet();
         long timestamp = System.currentTimeMillis();
 
-        String requestId = String.format("%s-%d-%d", clientId, timestamp, seq);
+        String requestId = clientId + "-" + timestamp + "-" + seq;
         String value = generatePayload(MESSAGE_SIZE_BYTES);
 
         ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC, requestId, value);
@@ -130,6 +152,8 @@ public class HeavyProducer implements AutoCloseable {
         long start=System.nanoTime();
         startNanos.put(requestId, start);
         logger.logStage(clientId, "send_start", requestId);
+
+        sentCount.incrementAndGet();
 
         producer.send(record, (metadata, exception) -> {
             // ack_received 로깅
@@ -141,6 +165,8 @@ public class HeavyProducer implements AutoCloseable {
                     exception.printStackTrace();
                     return;
                 }
+
+                ackCount.incrementAndGet();
                 long prevAck=lastAckNanos.getAndSet(end);
                 if(prevAck>0){
                     logger.logLatency(clientId, "service_gap", requestId, prevAck, end);

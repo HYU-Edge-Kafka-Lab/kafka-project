@@ -13,29 +13,28 @@ import java.time.format.DateTimeFormatter;
 /**
  * Stage별 로그 기록기
  *
- * 로그 포맷 (KICKOFF.md 10.1절):
+ * 로그 포맷:
  * {ts}|{thread}|{clientId}|{stage}|{requestId}|{latency_ms}
  *
  * 예시:
- * 2024-01-15T10:30:00.123|network-thread-0|heavy-producer-1|read_done|12345|2.5
- * 2024-01-15T10:30:00.125|network-thread-0|heavy-producer-1|enqueue_req|12345|0.3
+ * 2024-01-15T10:30:00.123|network-thread-0|heavy-producer-1|send_start|12345|-1
+ * 2024-01-15T10:30:00.125|network-thread-0|heavy-producer-1|ack_received|12345|2.5
  *
- * Stage 정의 (KICKOFF.md 4.1절, 4.2절):
+ * 주요 Stage 정의:
  *
- * 브로커 내부:
- * - poll: Selector.poll() 시점
- * - read_done: 데이터 읽기 완료
- * - enqueue_req: RequestChannel에 요청 적재
- * - dequeue_req: Handler가 요청 꺼냄
- * - handle_done: Handler 처리 완료
- * - send_done: Response 전송 완료
+ * Producer:
+ * - send_start: Producer 메시지 전송 시작
+ * - ack_received: Broker ACK 수신 시점
+ * - service_gap: 이전 ACK와 현재 ACK 사이 간격
  *
- * 클라이언트:
- * - send_start: Producer 전송 시작
- * - ack_received: Producer ACK 수신
- * - poll_start: Consumer poll 시작
- * - fetch_received: Consumer fetch 완료
- * - process_done: Consumer 처리 완료
+ * Consumer:
+ * - fetch_received: 메시지 fetch 완료
+ * - process_done: 메시지 처리 완료
+ * - poll_timeout: poll에서 메시지를 받지 못한 경우
+ *
+ * 이 로그는 실험 시나리오(S0, S1, S1N)에서
+ * Producer/Consumer 동작 타이밍을 기록하고
+ * ACK latency 및 service gap 분석에 사용된다.
  */
 public class StageLogger {
 
@@ -49,7 +48,7 @@ public class StageLogger {
     /**
      * 클라이언트별 StageLogger 생성자
      *
-     * @param scenarioId 실험 시나리오 ID (e.g., S1, S2)
+     * @param scenarioId 실험 시나리오 ID (e.g., S0, S1, S1N)
      * @param clientId   클라이언트 ID (e.g., heavy-producer-1)
      */
     public StageLogger(String scenarioId, String clientId) throws IOException {
