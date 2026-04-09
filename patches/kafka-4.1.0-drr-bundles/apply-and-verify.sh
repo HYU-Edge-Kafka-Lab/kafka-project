@@ -26,12 +26,12 @@ cd "$KAFKA_SRC_ROOT"
 
 for patch_file in "$PATCH_DIR"/0*.patch; do
   echo "[CHECK] $(basename "$patch_file")"
-  git apply --check "$patch_file"
+  git apply --check --recount "$patch_file"
 done
 
 for patch_file in "$PATCH_DIR"/0*.patch; do
   echo "[APPLY] $(basename "$patch_file")"
-  git apply "$patch_file"
+  git apply --recount "$patch_file"
 done
 
 if [[ "$VERIFY_MODE" == "--no-verify" ]]; then

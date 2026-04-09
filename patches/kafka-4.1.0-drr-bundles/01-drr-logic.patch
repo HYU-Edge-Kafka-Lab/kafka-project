@@ -6,7 +6,6 @@ index 151a0fb..7cb635b 100644
  import java.util.Iterator;
  import java.util.LinkedHashMap;
  import java.util.List;
-+import java.util.Locale;
  import java.util.Map;
  import java.util.Optional;
  import java.util.Set;
@@ -23,7 +22,8 @@ index 151a0fb..7cb635b 100644
 +            if (value == null) {
 +                return DEFAULT;
 +            }
-+            String normalizedValue = value.trim().toLowerCase(Locale.ROOT);
++            // Keep parsing semantics aligned with the broker config validator.
++            String normalizedValue = value.trim();
 +            switch (normalizedValue) {
 +                case "default":
 +                    return DEFAULT;
@@ -117,6 +117,8 @@ index 151a0fb..7cb635b 100644
 +    private final HandlingOrderPolicy handlingOrderPolicy;
 +    private final DrrConfig drrConfig;
 +    private final Map<String, Long> drrDeficits;
++    private final Map<String, Long> drrPollEpochs;
++    private long drrPollId;
  
      //indicates if the previous call to poll was able to make progress in reading already-buffered data.
      //this is used to prevent tight loops when memory is not available to read any more data
@@ -153,7 +155,14 @@ index 151a0fb..7cb635b 100644
 +            readSchedulingConfig == null ? ReadSchedulingConfig.defaultConfig() : readSchedulingConfig;
 +        this.handlingOrderPolicy = effectiveReadSchedulingConfig.handlingOrderPolicy();
 +        this.drrConfig = effectiveReadSchedulingConfig.drrConfig();
-+        this.drrDeficits = this.handlingOrderPolicy == HandlingOrderPolicy.DRR ? new HashMap<>() : Collections.emptyMap();
++        if (this.handlingOrderPolicy == HandlingOrderPolicy.DRR) {
++            this.drrDeficits = new HashMap<>();
++            this.drrPollEpochs = new HashMap<>();
++        } else {
++            this.drrDeficits = Collections.emptyMap();
++            this.drrPollEpochs = Collections.emptyMap();
++        }
++        this.drrPollId = 0L;
          this.delayedClosingChannels = (failedAuthenticationDelayMs > NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap<>() : null;
      }
  
@@ -161,7 +170,7 @@ index 151a0fb..7cb635b 100644
          this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds(), false);
  
          if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
-+            replenishDrrDeficits();
++            advanceDrrPoll();
              Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
  
              // Poll from channels that have buffered data (but nothing more from the underlying socket)
@@ -171,7 +180,7 @@ index 151a0fb..7cb635b 100644
                  if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
 -                        && !explicitlyMutedChannels.contains(channel)) {
 -                    attemptRead(channel);
-+                        && !explicitlyMutedChannels.contains(channel) && canReadWithDrrBudget(channel)) {
++                        && !explicitlyMutedChannels.contains(channel) && canReadWithSchedulingBudget(key, channel)) {
 +                    long bytesRead = attemptRead(channel);
 +                    consumeDrrBudget(channel, bytesRead);
                  }
@@ -224,68 +233,105 @@ index 151a0fb..7cb635b 100644
 +        return handlingOrderPolicy == HandlingOrderPolicy.DRR;
 +    }
 +
-+    private void replenishDrrDeficits() {
++    private void advanceDrrPoll() {
 +        if (!isDrrEnabled()) {
 +            return;
 +        }
-+        for (KafkaChannel channel : channels.values()) {
-+            String connectionId = channel.id();
-+            long currentDeficit = drrDeficits.getOrDefault(connectionId, 0L);
-+            long updatedDeficit = saturatingAdd(currentDeficit, drrConfig.quantum());
-+            drrDeficits.put(connectionId, boundedDeficit(updatedDeficit));
-+        }
++        drrPollId = saturatingAdd(drrPollId, 1L);
 +    }
 +
 +    private boolean canReadWithDrrBudget(KafkaChannel channel) {
 +        if (!isDrrEnabled()) {
 +            return true;
 +        }
++        replenishDrrDeficitIfNeeded(channel.id());
 +        long deficit = drrDeficits.getOrDefault(channel.id(), 0L);
-+        return deficit >= estimatedDrrCost();
++        return deficit >= estimatedDrrCost(drrConfig);
++    }
++
++    private boolean canReadWithSchedulingBudget(SelectionKey key, KafkaChannel channel) {
++        if (!isDrrEnabled()) {
++            return true;
++        }
++        // Preserve existing buffered/closing semantics. DRR should only gate normal ready-key reads.
++        if ((channel.hasBytesBuffered() && !key.isReadable()) || closingChannels.containsKey(channel.id())) {
++            return true;
++        }
++        return canReadWithDrrBudget(channel);
++    }
++
++    private void replenishDrrDeficitIfNeeded(String connectionId) {
++        Long lastUpdatedPoll = drrPollEpochs.get(connectionId);
++        if (!shouldReplenishForPoll(drrPollId, lastUpdatedPoll)) {
++            return;
++        }
++
++        // Replenish lazily for channels that actually participate in this poll.
++        long currentDeficit = drrDeficits.getOrDefault(connectionId, 0L);
++        drrDeficits.put(connectionId, replenishDeficit(drrConfig, currentDeficit));
++        drrPollEpochs.put(connectionId, drrPollId);
 +    }
 +
 +    private void consumeDrrBudget(KafkaChannel channel, long bytesRead) {
 +        if (!isDrrEnabled()) {
 +            return;
 +        }
-+        long cost = drrCost(bytesRead);
++        long cost = drrCost(drrConfig, bytesRead);
 +        if (cost <= 0) {
 +            return;
 +        }
 +        long currentDeficit = drrDeficits.getOrDefault(channel.id(), 0L);
-+        drrDeficits.put(channel.id(), boundedDeficit(currentDeficit - cost));
++        drrDeficits.put(channel.id(), chargeDeficit(drrConfig, currentDeficit, bytesRead));
 +    }
 +
-+    private long estimatedDrrCost() {
++    // Small static helpers keep the runtime path readable and give unit tests stable seams.
++    static boolean shouldReplenishForPoll(long currentPollId, Long lastUpdatedPoll) {
++        return lastUpdatedPoll == null || lastUpdatedPoll != currentPollId;
++    }
++
++    static long replenishDeficit(DrrConfig drrConfig, long currentDeficit) {
++        long updatedDeficit = saturatingAdd(currentDeficit, drrConfig.quantum());
++        return boundedDeficit(drrConfig, updatedDeficit);
++    }
++
++    static long chargeDeficit(DrrConfig drrConfig, long currentDeficit, long bytesRead) {
++        long cost = drrCost(drrConfig, bytesRead);
++        if (cost <= 0) {
++            return currentDeficit;
++        }
++        return boundedDeficit(drrConfig, saturatingAdd(currentDeficit, -cost));
++    }
++
++    static long estimatedDrrCost(DrrConfig drrConfig) {
 +        if (!drrConfig.enableBytesCost()) {
 +            return 1L;
 +        }
 +        return drrConfig.minCost();
 +    }
 +
-+    private long drrCost(long bytesRead) {
-+        if (!drrConfig.enableBytesCost()) {
-+            return 1L;
-+        }
++    static long drrCost(DrrConfig drrConfig, long bytesRead) {
 +        if (bytesRead <= 0) {
 +            return 0L;
++        }
++        if (!drrConfig.enableBytesCost()) {
++            return 1L;
 +        }
 +        return Math.max(bytesRead, drrConfig.minCost());
 +    }
 +
-+    private long boundedDeficit(long deficit) {
-+        long minDeficit = -drrConfig.maxDeficit();
++    static long boundedDeficit(DrrConfig drrConfig, long deficit) {
 +        long maxDeficit = drrConfig.maxDeficit();
-+        if (deficit < minDeficit) {
-+            return minDeficit;
-+        }
 +        if (deficit > maxDeficit) {
 +            return maxDeficit;
++        }
++        // Preserve negative debt in bytes-cost mode so a large read is repaid over multiple polls.
++        if (!drrConfig.enableBytesCost() && deficit < -maxDeficit) {
++            return -maxDeficit;
 +        }
 +        return deficit;
 +    }
 +
-+    private long saturatingAdd(long left, long right) {
++    private static long saturatingAdd(long left, long right) {
 +        if (right > 0 && left > Long.MAX_VALUE - right) {
 +            return Long.MAX_VALUE;
 +        }
@@ -298,6 +344,7 @@ index 151a0fb..7cb635b 100644
 +    private void clearDrrDeficit(String connectionId) {
 +        if (isDrrEnabled()) {
 +            drrDeficits.remove(connectionId);
++            drrPollEpochs.remove(connectionId);
 +        }
 +    }
 +

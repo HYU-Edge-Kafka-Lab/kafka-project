@@ -17,7 +17,7 @@ index e9c3dff..d43638a 100644
 +    public static final String SOCKET_READ_SCHEDULING_POLICY_CONFIG = "socket.read.scheduling.policy";
 +    public static final String SOCKET_READ_SCHEDULING_POLICY_DEFAULT = "default";
 +    public static final String SOCKET_READ_SCHEDULING_POLICY_DOC =
-+            "Read scheduling policy for socket selector. Supported values are <code>default</code>, " +
++            "Read scheduling policy for socket selector. Supported lowercase values are <code>default</code>, " +
 +                    "<code>shuffle</code> and <code>drr</code>.";
 +
 +    public static final String SOCKET_READ_SCHEDULING_DRR_QUANTUM_CONFIG = "socket.read.scheduling.drr.quantum";
@@ -35,7 +35,8 @@ index e9c3dff..d43638a 100644
 +    public static final String SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG = "socket.read.scheduling.drr.max.deficit";
 +    public static final long SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DEFAULT = 8L;
 +    public static final String SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DOC =
-+            "Maximum absolute deficit bound per connection used by DRR.";
++            "Maximum accumulated positive deficit per connection used by DRR. In bytes-cost mode, negative debt is " +
++                    "left unbounded so large reads are repaid over multiple polls.";
 +
 +    public static final String SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG =
 +            "socket.read.scheduling.drr.enable.bytes.cost";
@@ -93,6 +94,7 @@ index 884c000..c43d7c9 100644
        memoryPool,
 -      logContext)
 +      logContext,
++      // Keep selector-side scheduling changes isolated to a single config object.
 +      new KSelector.ReadSchedulingConfig(
 +        KSelector.HandlingOrderPolicy.forName(config.socketReadSchedulingPolicy),
 +        new KSelector.DrrConfig(
