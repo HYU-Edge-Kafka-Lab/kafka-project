@@ -1,150 +1,111 @@
-# Kafka Selector Starvation & Network Thread 분석
+# Kafka 4.1.0 DRR Patch + Experiment Guide
 
-Kafka Broker의 Network Thread / Selector 이벤트 처리 구조를 분석하고, Selector starvation 발생 가능 여부를 실험적으로 검증하는 프로젝트입니다.
+이 저장소에서 외부에 공유해야 할 핵심은 두 가지입니다.
 
-## 프로젝트 목적
+- Kafka 4.1.0 `Selector` read scheduling용 DRR patch bundle
+- patch 적용 후 fairness 실험을 돌리는 harness
 
-| 구분 | 내용 |
-|------|------|
-| 목적 1 | Kafka Broker의 Network Thread / Selector 이벤트 처리 구조를 명확히 이해하고 문서화 |
-| 목적 2 | 해당 구조에서 Selector starvation이 발생 가능한지 여부를 실험적으로 검증 |
+## 포함 파일
 
-## 기술 스택
+- [`patches/kafka-4.1.0-drr-bundles`](/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles)
+- [`scripts/run-scenario.sh`](/Users/taehee/personal/kafka-project/scripts/run-scenario.sh)
+- [`src/main/java/com/kafka/io/kafkaproject/scenarios/ScenarioRunner.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/scenarios/ScenarioRunner.java)
+- [`src/main/java/com/kafka/io/kafkaproject/analysis/metrics/LogSummaryTool.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/analysis/metrics/LogSummaryTool.java)
+- [`src/main/java/com/kafka/io/kafkaproject/logging/StageLogger.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/logging/StageLogger.java)
 
-- **Kafka**: 4.1.0
-- **Java**: JDK 21 (Temurin)
-- **Spring Boot**: 4.0.2
-- **브로커 모드**: KRaft (ZK 의존성 제거)
+## 전제
 
-## 프로젝트 구조
+- 이 저장소에는 Kafka 브로커 소스 전체가 없습니다.
+- DRR는 Kafka 4.1.0 소스 트리에 patch로 적용해야 합니다.
+- 현재 [`docker-compose.yml`](/Users/taehee/personal/kafka-project/docker-compose.yml)과 [`scripts/start-broker.sh`](/Users/taehee/personal/kafka-project/scripts/start-broker.sh)는 순정 Kafka 경로라 DRR 실험용이 아닙니다.
 
-```
-kafka-project/
-├── src/main/java/com/kafka/io/kafkaproject/
-│   │
-│   ├── analysis/                          # A 담당: 구조 분석
-│   │   ├── selector/
-│   │   │   └── SelectorAnalyzer.java      # Selector 내부 동작 분석
-│   │   ├── network/
-│   │   │   └── NetworkThreadTracer.java   # Network Thread 추적
-│   │   └── metrics/
-│   │       └── StarvationDetector.java    # Starvation 판정 (임계값 기반)
-│   │
-│   ├── clients/                           # B 담당: 부하 클라이언트
-│   │   ├── producer/
-│   │   │   ├── HeavyProducer.java         # 고부하 연속 전송 (10KB, 64KB batch)
-│   │   │   └── LightProducer.java         # 저부하 간헐적 전송 (1KB, 100ms 간격)
-│   │   └── consumer/
-│   │       ├── SlowConsumer.java          # 처리 지연 소비자 (500ms/batch)
-│   │       └── NormalConsumer.java        # 정상 속도 소비자
-│   │
-│   ├── scenarios/
-│   │   └── ScenarioRunner.java            # S0~S3 실험 시나리오 실행기
-│   │
-│   ├── logging/
-│   │   └── StageLogger.java               # Stage별 로그 기록기
-│   │
-│   └── config/
-│       └── KafkaConfig.java               # 실험 설정값 상수
-│
-├── scripts/
-│   ├── start-broker.sh                    # KRaft 브로커 시작
-│   └── run-scenario.sh                    # 시나리오 실행
-│
-├── results/                               # 실험 결과 CSV 저장
-│
-├── docs/
-│   ├── architecture.md                    # Network Thread 아키텍처
-│   └── stage-mapping.md                   # Stage ↔ 코드 위치 매핑
-│
-├── KICKOFF.md                             # 프로젝트 킥오프 정의 문서
-└── README.md
+## 1. Kafka 4.1.0 준비
+
+Kafka 4.1.0 소스 트리 두 개를 준비합니다.
+
+```bash
+/path/to/kafka-4.1.0-pristine
+/path/to/kafka-4.1.0-drr
 ```
 
-## 실험 시나리오
+## 2. DRR patch 적용
 
-| ID | 이름 | 설명 | Heavy TPS | Light TPS |
-|----|------|------|-----------|-----------|
-| S0 | Balanced Load | 대조군 (균형 부하) | 1,000 | 1,000 |
-| S1 | Heavy vs Light | Read 편향 테스트 | 10,000 | 100 |
-| S2 | Slow Consumer | Write 편향 테스트 (Backpressure) | 5,000 | - |
-| S3 | Control-plane | Control 요청 지연 테스트 | 5,000 | 10 |
-
-## Starvation 판정 기준
-
-### 지연 기준
-| 지표 | 임계값 |
-|------|--------|
-| p95 latency | ≥ 50ms |
-| p99 latency | ≥ 200ms |
-| max latency | ≥ 1,000ms |
-| 요청 간격 | ≥ 5초 |
-
-### 편향 기준
-- 단일 client가 전체 처리의 **70% 이상** 점유
-- 해당 편향이 **30초 이상** 지속
-
-## 로그 포맷
-
+```bash
+/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles/apply-and-verify.sh \
+  /path/to/kafka-4.1.0-drr
 ```
-{ts}|{thread}|{clientId}|{stage}|{requestId}|{latency_ms}
+
+baseline 비교:
+
+```bash
+/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles/compare-pristine-and-patched.sh \
+  /path/to/kafka-4.1.0-pristine \
+  /path/to/kafka-4.1.0-drr
 ```
+
+## 3. 브로커 설정
+
+patch 적용 후, DRR broker의 `config/kraft/server.properties`에 아래 설정을 추가합니다.
+
+```properties
+socket.read.scheduling.policy=drr
+socket.read.scheduling.drr.quantum=1
+socket.read.scheduling.drr.min.cost=1
+socket.read.scheduling.drr.max.deficit=8
+socket.read.scheduling.drr.enable.bytes.cost=false
+```
+
+비교 실험 시 설정값:
+
+- baseline: `socket.read.scheduling.policy=default`
+- shuffle: `socket.read.scheduling.policy=shuffle`
+- drr: 위 5개 설정 사용
+
+## 4. DRR broker 실행
 
 예시:
-```
-2024-01-15T10:30:00.123|network-thread-0|heavy-producer-1|read_done|12345|2.5
-2024-01-15T10:30:00.125|network-thread-0|heavy-producer-1|enqueue_req|12345|0.3
-```
 
-## 빠른 시작
-
-### 1. 빌드
 ```bash
+KAFKA_HOME=/path/to/kafka-4.1.0-drr
+CONFIG_FILE="$KAFKA_HOME/config/kraft/server.properties"
+
+KAFKA_CLUSTER_ID=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
+"$KAFKA_HOME/bin/kafka-storage.sh" format -t "$KAFKA_CLUSTER_ID" -c "$CONFIG_FILE"
+"$KAFKA_HOME/bin/kafka-server-start.sh" "$CONFIG_FILE"
+```
+
+현재 실험 코드는 broker 주소를 `localhost:9092`로 가정합니다.
+
+## 5. 실험 harness 빌드
+
+```bash
+cd /Users/taehee/personal/kafka-project
 ./gradlew build
 ```
 
-### 2. 브로커 시작
-```bash
-./scripts/start-broker.sh
-```
+## 6. 실험 실행
 
-### 3. 시나리오 실행
+결과 로그는 `results/<scenario>/`에 append 되므로 재실행 전 삭제를 권장합니다.
+
 ```bash
-# S0 시나리오, 60초 실행
+rm -rf results/S0 results/S1 results/S1N
 ./scripts/run-scenario.sh S0 60
-
-# S1 시나리오, 120초 실행
 ./scripts/run-scenario.sh S1 120
+./scripts/run-scenario.sh S1N 120
 ```
 
-### 4. 결과 확인
+지원 시나리오:
+
+- `S0`: balanced baseline
+- `S1`: heavy vs single light
+- `S1N`: heavy vs many light
+
+## 7. 결과 확인
+
 ```bash
-ls results/
+sed -n '1,20p' results/S0/summary.csv
+sed -n '1,20p' results/S1/summary.csv
+sed -n '1,20p' results/S1N/summary.csv
 ```
 
-## 주요 분석 대상 클래스
-
-| 클래스 | 역할 |
-|--------|------|
-| `kafka.network.SocketServer` | Acceptor, Processor 관리 |
-| `kafka.network.Processor` | Network Thread 구현체 |
-| `org.apache.kafka.common.network.Selector` | NIO Selector 래퍼 (핵심) |
-| `kafka.network.RequestChannel` | Request/Response 큐 |
-
-## 역할 분담
-
-### A 담당: 구조 분석
-- Network Thread 흐름도
-- Stage ↔ 코드 위치 매핑
-- Starvation 관측 포인트 정의
-
-### B 담당: 실험 설계 및 실행
-- 부하 생성 클라이언트 구현
-- 시나리오별 실험 실행
-- 결과 데이터 수집 및 분석
-
-## 참고 문서
-
-- [KICKOFF.md](./KICKOFF.md) - 프로젝트 킥오프 정의 문서
-- [docs/architecture.md](./docs/architecture.md) - Network Thread 아키텍처
-- [docs/stage-mapping.md](./docs/stage-mapping.md) - Stage 코드 매핑
+기본 요약 대상은 `ack_received`, `service_gap`입니다.

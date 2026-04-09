@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..c983c1b
 --- /dev/null
 +++ b/clients/src/test/java/org/apache/kafka/common/network/SelectorSchedulingPolicyTest.java
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,69 @@
 +/*
 + * Licensed to the Apache Software Foundation (ASF) under one or more
 + * contributor license agreements. See the NOTICE file distributed with
@@ -25,7 +25,9 @@ index 0000000..c983c1b
 +import org.junit.jupiter.api.Test;
 +
 +import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
 +import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
 +
 +class SelectorSchedulingPolicyTest {
 +
@@ -35,12 +37,12 @@ index 0000000..c983c1b
 +        assertEquals(Selector.HandlingOrderPolicy.DEFAULT, Selector.HandlingOrderPolicy.forName("default"));
 +        assertEquals(Selector.HandlingOrderPolicy.SHUFFLE, Selector.HandlingOrderPolicy.forName("shuffle"));
 +        assertEquals(Selector.HandlingOrderPolicy.DRR, Selector.HandlingOrderPolicy.forName("drr"));
-+        assertEquals(Selector.HandlingOrderPolicy.DRR, Selector.HandlingOrderPolicy.forName("DRR"));
 +    }
 +
 +    @Test
 +    void testHandlingOrderPolicyForNameUnknownValue() {
 +        assertThrows(IllegalArgumentException.class, () -> Selector.HandlingOrderPolicy.forName("unknown"));
++        assertThrows(IllegalArgumentException.class, () -> Selector.HandlingOrderPolicy.forName("DRR"));
 +    }
 +
 +    @Test
@@ -48,6 +50,55 @@ index 0000000..c983c1b
 +        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(0, 1, 1, false));
 +        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(1, 0, 1, false));
 +        assertThrows(IllegalArgumentException.class, () -> new Selector.DrrConfig(1, 1, 0, false));
++    }
++
++    @Test
++    void testReadSchedulingConfigDefaultsWhenNullSafe() {
++        Selector.ReadSchedulingConfig config = new Selector.ReadSchedulingConfig(null, null);
++
++        assertEquals(Selector.HandlingOrderPolicy.DEFAULT, config.handlingOrderPolicy());
++        assertEquals(1L, config.drrConfig().quantum());
++        assertEquals(1L, config.drrConfig().minCost());
++        assertEquals(8L, config.drrConfig().maxDeficit());
++        assertFalse(config.drrConfig().enableBytesCost());
++    }
++
++    @Test
++    void testShouldReplenishForPollOnlyOncePerPoll() {
++        assertTrue(Selector.shouldReplenishForPoll(1L, null));
++        assertTrue(Selector.shouldReplenishForPoll(2L, 1L));
++        assertFalse(Selector.shouldReplenishForPoll(2L, 2L));
++    }
++
++    @Test
++    void testReplenishAndChargeFixedCost() {
++        Selector.DrrConfig drrConfig = new Selector.DrrConfig(1, 1, 8, false);
++
++        long deficit = Selector.replenishDeficit(drrConfig, 0L);
++
++        assertEquals(1L, deficit);
++        assertEquals(1L, Selector.estimatedDrrCost(drrConfig));
++        assertEquals(0L, Selector.chargeDeficit(drrConfig, deficit, 128L));
++    }
++
++    @Test
++    void testChargeDeficitKeepsBytesDebt() {
++        Selector.DrrConfig drrConfig = new Selector.DrrConfig(4, 1, 8, true);
++
++        long deficit = Selector.replenishDeficit(drrConfig, 0L);
++
++        assertEquals(4L, deficit);
++        assertEquals(-28L, Selector.chargeDeficit(drrConfig, deficit, 32L));
++    }
++
++    @Test
++    void testFixedCostDoesNotChargeWhenReadMakesNoProgress() {
++        Selector.DrrConfig drrConfig = new Selector.DrrConfig(1, 1, 8, false);
++
++        assertEquals(0L, Selector.drrCost(drrConfig, 0L));
++        assertEquals(0L, Selector.drrCost(drrConfig, -1L));
++        assertEquals(1L, Selector.chargeDeficit(drrConfig, 1L, 0L));
++        assertEquals(1L, Selector.chargeDeficit(drrConfig, 1L, -1L));
 +    }
 +}
 diff --git a/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java b/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
@@ -106,6 +157,8 @@ index be4184a..f87dd83 100644
 +                SocketServerConfigs.CONFIG_DEF.parse(
 +                        Map.of(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG, "drr"))
 +                        .get(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG));
++        assertThrows(ConfigException.class, () -> SocketServerConfigs.CONFIG_DEF.parse(
++                Map.of(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG, "DRR")));
 +        assertThrows(ConfigException.class, () -> SocketServerConfigs.CONFIG_DEF.parse(
 +                Map.of(SocketServerConfigs.SOCKET_READ_SCHEDULING_POLICY_CONFIG, "unknown-policy")));
 +    }
