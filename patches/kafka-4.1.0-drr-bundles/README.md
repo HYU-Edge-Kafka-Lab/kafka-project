@@ -1,9 +1,19 @@
-# DRR Patch Bundles (3 files)
+# DRR Patch Bundles (4 files)
 
 적용 순서:
 1) `01-drr-logic.patch`
 2) `02-drr-config-wireup.patch`
 3) `03-drr-tests.patch`
+4) `04-selector-scheduling-instrumentation.patch`
+
+추가된 4번 patch는 `default`, `shuffle`, `drr` 공통 selector 계측을 넣는다.
+- `ready_count`
+- `read_count`
+- `skip_count`
+- `ready_to_read_delay`
+
+계측 config:
+- `socket.read.scheduling.instrumentation.enable=true`
 
 중요:
 - `apply-and-verify.sh`는 패치 적용본 자체가 컴파일/타깃 테스트를 통과하는지 본다.

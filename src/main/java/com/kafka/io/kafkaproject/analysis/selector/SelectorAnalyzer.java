@@ -24,27 +24,27 @@ public class SelectorAnalyzer {
      * clients/src/main/java/org/apache/kafka/common/network/Selector.java
      */
     public void analyzePollBehavior() {
-        // TODO: Selector.poll() 호출 패턴 분석
+        // 향후 분석 후보:
         // - poll 호출 빈도
         // - 한 번의 poll에서 처리하는 채널 수
-        // - ready 채널 선택 순서 (공정성 분석)
+        // - ready 채널 선택 순서 관찰
     }
 
     /**
      * Connection별 read 이벤트 처리 분석
      */
     public void analyzeReadDistribution() {
-        // TODO: 특정 Connection이 read를 독점하는지 분석
-        // - Connection별 read 횟수 추적
-        // - read 편향 비율 계산 (KICKOFF.md 3.2절 기준: 70% 이상 시 편향)
+        // 향후 분석 후보:
+        // - connection별 read 횟수 추적
+        // - read 편향 비율 계산
     }
 
     /**
      * Starvation 발생 가능 지점 식별
      */
     public void identifyStarvationPoints() {
-        // TODO: Selector 레벨에서 starvation 발생 가능 지점
-        // - 대용량 데이터 전송 시 다른 채널 처리 지연
-        // - write buffer 가득 찼을 때 영향
+        // 향후 분석 후보:
+        // - Selector 레벨의 처리 지연 가능 지점 식별
+        // - 대용량 전송 및 write buffer 상태의 영향 관찰
     }
 }

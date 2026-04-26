@@ -45,8 +45,8 @@ public class StarvationDetector {
      * @param latencyMs  해당 단계 소요 시간
      */
     public void recordLatency(String clientId, String stage, long latencyMs) {
-        // TODO: 구현
-        // - Client별 latency 히스토그램 업데이트
+        // 향후 확장 지점:
+        // - client별 latency 히스토그램 업데이트
         // - p95, p99, max 계산
     }
 
@@ -56,9 +56,9 @@ public class StarvationDetector {
      * @return 편향 발생 여부
      */
     public boolean checkBias() {
-        // TODO: 구현
-        // - 최근 N초간 client별 처리 비율 계산
-        // - 70% 이상 점유 client 존재 시 true
+        // 향후 확장 지점:
+        // - 최근 구간의 client별 처리 비율 계산
+        // - 임계치 이상 점유 client 존재 여부 판단
         return false;
     }
 
@@ -68,9 +68,9 @@ public class StarvationDetector {
      * @return Starvation 판정 결과
      */
     public StarvationResult detect() {
-        // TODO: 구현
+        // 향후 확장 지점:
         // - 지연 기준 + 편향 기준 종합 판단
-        // - 병목 위치 식별 (Network vs Handler)
+        // - 병목 위치 식별
         return new StarvationResult(false, "N/A", "N/A");
     }
 
@@ -89,6 +89,6 @@ public class StarvationDetector {
     private static class ClientMetrics {
         Instant lastRequestTime;
         long requestCount;
-        // TODO: latency 히스토그램 추가
+        // 필요 시 latency 히스토그램을 추가할 수 있다.
     }
 }

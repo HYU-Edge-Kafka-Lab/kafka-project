@@ -1,5 +1,7 @@
 package com.kafka.io.kafkaproject.logging;
 
+import com.kafka.io.kafkaproject.config.ExperimentPaths;
+
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -52,11 +54,11 @@ public class StageLogger {
      * @param clientId   클라이언트 ID (e.g., heavy-producer-1)
      */
     public StageLogger(String scenarioId, String clientId) throws IOException {
-        // results/{scenarioId} 디렉토리 생성
-        Path dirPath=Path.of("results", scenarioId);
+        // results/{policy}/{scenarioId} 디렉토리 생성
+        Path dirPath = ExperimentPaths.scenarioDir(scenarioId);
         Files.createDirectories(dirPath);
 
-        // results/{scenarioId}/{clientId}.log
+        // results/{policy}/{scenarioId}/{clientId}.log
         File logFile=dirPath.resolve(clientId+".log").toFile();
         boolean isNewFile=!logFile.exists();
         this.writer = new PrintWriter(new FileWriter(logFile, true));

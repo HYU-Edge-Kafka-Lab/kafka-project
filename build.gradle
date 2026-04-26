@@ -37,3 +37,13 @@ dependencies {
 tasks.named('test') {
     useJUnitPlatform()
 }
+
+tasks.register('javaexec', JavaExec) {
+    group = 'application'
+    description = 'Runs an arbitrary main class when -PmainClass is provided.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = project.findProperty('mainClass')
+    if (project.hasProperty('args')) {
+        args project.property('args').toString().split(/\s+/).findAll { !it.isBlank() }
+    }
+}

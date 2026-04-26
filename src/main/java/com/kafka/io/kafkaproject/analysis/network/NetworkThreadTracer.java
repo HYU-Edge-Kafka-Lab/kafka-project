@@ -26,9 +26,9 @@ public class NetworkThreadTracer {
      * core/src/main/scala/kafka/network/SocketServer.scala
      */
     public void traceConnectionAssignment() {
-        // TODO: 새 연결이 어떤 Processor에 할당되는지 추적
-        // - Round-robin 방식 확인
-        // - Processor별 연결 수 균형 분석
+        // 향후 분석 후보:
+        // - 새 연결의 Processor 할당 방식 확인
+        // - Processor별 연결 수 균형 관찰
     }
 
     /**
@@ -38,9 +38,9 @@ public class NetworkThreadTracer {
      * core/src/main/scala/kafka/network/SocketServer.scala - Processor.run()
      */
     public void traceRequestFlow() {
-        // TODO: 단일 Processor 내에서 request 처리 순서
-        // - poll -> read -> enqueue 시간 측정
-        // - 특정 client request가 지연되는 패턴 분석
+        // 향후 분석 후보:
+        // - poll -> read -> enqueue 흐름의 시간 분포 측정
+        // - 특정 client request 지연 패턴 관찰
     }
 
     /**
@@ -50,17 +50,17 @@ public class NetworkThreadTracer {
      * core/src/main/scala/kafka/network/RequestChannel.scala
      */
     public void analyzeRequestQueue() {
-        // TODO: Request queue 적체 상태 모니터링
-        // - queued.max.requests (500) 도달 여부
-        // - enqueue 대기 시간 측정
+        // 향후 분석 후보:
+        // - request queue 적체 상태 모니터링
+        // - enqueue 대기 시간 분포 측정
     }
 
     /**
      * Response 전송 분석 (send_done stage)
      */
     public void traceResponseSend() {
-        // TODO: Response 전송 지연 분석
-        // - send buffer 상태
-        // - Slow Consumer로 인한 backpressure 영향
+        // 향후 분석 후보:
+        // - response 전송 지연 분석
+        // - send buffer/backpressure 영향 관찰
     }
 }
