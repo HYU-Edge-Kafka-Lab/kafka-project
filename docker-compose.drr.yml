@@ -1,0 +1,15 @@
+services:
+  kafka:
+    image: kafka-drr:4.1.0
+    container_name: kafka41-drr
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_CLUSTER_ID: "${KAFKA_CLUSTER_ID:-}"
+    volumes:
+      - kafka-drr-data:/var/lib/kafka/data
+      - ./docker/drr/server.properties:/etc/kafka/server.properties:ro
+
+volumes:
+  kafka-drr-data:

@@ -90,7 +90,6 @@ public class NormalConsumer implements AutoCloseable {
 
             long processDone = System.nanoTime();
 
-            // TODO: 로깅
             logger.logLatency(clientId, "process_done","-", pollEnd, processDone);
         }
     }

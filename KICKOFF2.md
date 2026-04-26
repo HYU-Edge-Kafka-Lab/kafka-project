@@ -1,5 +1,9 @@
 # Kafka Selector Fairness Degradation Analysis
 
+> 상태: 중간 실험 설계 문서
+>
+> 이 문서는 fairness/service_gap 중심의 중간 설계안을 정리한 작업 문서이다. 현재 저장소의 최종 실험 방향 및 보고서 결론과는 차이가 있을 수 있으며, 최신 기준은 README와 최종 보고서 본문을 따른다.
+
 ## 프로젝트 킥오프 정의 문서
 
 ---

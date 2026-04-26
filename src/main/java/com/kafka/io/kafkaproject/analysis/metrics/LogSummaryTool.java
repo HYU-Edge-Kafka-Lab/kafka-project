@@ -1,5 +1,7 @@
 package com.kafka.io.kafkaproject.analysis.metrics;
 
+import com.kafka.io.kafkaproject.config.ExperimentPaths;
+
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.FileNotFoundException;
@@ -12,14 +14,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 /**
- * results/{scenarioId}/*.log 파일을 읽어 stage별 latency 통계를 summary.csv로 저장한다.
+ * results/{policy}/{scenarioId}/*.log 파일을 읽어 stage별 latency 통계를 summary.csv로 저장한다.
  * 로그 포맷:
  * ts|thread|clientId|stage|requestId|latency_ms
  *
  * 측정 대상 stage 예시:
- * - ack_received : Producer가 send_start 이후 ACK를 수신하기까지의 latency
- * - service_gap  : 동일 connection에서 연속된 ACK 사이의 시간 간격
- * - fetch_received / process_done / poll_timeout : Consumer 측 측정 stage
+ * - ack_received : Producer가 send_start 이후 ACK를 수신하기까지의 외부 응답 latency
+ * - service_gap  : 동일 connection에서 연속된 ACK 사이의 시간 간격(보조 지표)
+ * - fetch_received / process_done / poll_timeout : Consumer 측 보조 측정 stage
  *
  * 출력 CSV(ROW 방식):
  * scenario,clientID,stage,samples,mean_ms,p0_ms,p10_ms,p20_ms,p30_ms,p40_ms,p50_ms,p60_ms,p70_ms,p80_ms,p90_ms,p95_ms,p99_ms,p100_ms
@@ -28,9 +30,9 @@ import java.util.*;
  * p0~p100 구간값(10% 단위)도 함께 저장한다.
 
  * 사용 예시(인텔리J에서 main 실행 + args):
- *   S0 ack_received service_gap --warmupSec 5
+ *   S0 ack_received --warmupSec 5
  *   S1 ack_received service_gap --warmupSec 5
- *   S1N_L5_T1000 ack_received service_gap --warmupSec 5
+ *   S1N ack_received service_gap --warmupSec 5
  *   S0 fetch_received process_done poll_timeout --warmupSec 5
  */
 public class LogSummaryTool {
@@ -41,12 +43,12 @@ public class LogSummaryTool {
         if(args.length < 2) {
             System.out.println("""
                     Usage:
-                      <scenarioId> <stage1> [stage2 ...] [--warmupSec N] [--out summary.csv]
+                      <scenarioId> <stage1> [stage2 ...] [--warmupSec N] [--policy default] [--out summary.csv]
 
                     Example:
-                      S0 ack_received service_gap --warmupSec 5
-                      S1 ack_received service_gap --warmupSec 5
-                      S1N_L5_T1000 ack_received service_gap --warmupSec 5
+                      S0 ack_received --warmupSec 5
+                      S1 ack_received service_gap --warmupSec 5 --policy shuffle
+                      S1N ack_received service_gap --warmupSec 5 --policy drr
                     """);
             return;
         }
@@ -62,12 +64,16 @@ public class LogSummaryTool {
 
         int warmupSec=0;
         String outName="summary.csv";
+        String policy = ExperimentPaths.resolvePolicy();
 
         while(i<args.length) {
             String opt=args[i];
             if("--warmupSec".equals(opt)) {
                 warmupSec=Integer.parseInt(args[i+1]);
                 i+=2;
+            }else if("--policy".equals(opt)) {
+                policy = args[i + 1];
+                i += 2;
             }else if("--out".equals(opt)) {
                 outName=args[i+1];
                 i+=2;
@@ -76,7 +82,7 @@ public class LogSummaryTool {
             }
         }
 
-        Path scenarioDir= Paths.get("results", scenarioId);
+        Path scenarioDir = ExperimentPaths.scenarioDir(policy, scenarioId);
         if(!Files.isDirectory(scenarioDir)) {
             throw new FileNotFoundException("scenario directory not found: "+scenarioDir);
         }

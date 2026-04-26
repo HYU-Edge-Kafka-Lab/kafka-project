@@ -1,0 +1,335 @@
+diff --git a/clients/src/main/java/org/apache/kafka/common/network/Selector.java b/clients/src/main/java/org/apache/kafka/common/network/Selector.java
+index 7cb635b..d8d2e21 100644
+--- a/clients/src/main/java/org/apache/kafka/common/network/Selector.java
++++ b/clients/src/main/java/org/apache/kafka/common/network/Selector.java
+@@ -84,6 +84,34 @@ public class Selector implements Selectable, AutoCloseable {
+     private static final Logger log = LoggerFactory.getLogger(Selector.class);
+     public static final long NO_IDLE_TIMEOUT_MS = -1;
+     public static final int NO_FAILED_AUTHENTICATION_DELAY = 0;
++
++    private static final long SCHEDULING_INSTRUMENTATION_FLUSH_INTERVAL_NANOS = 1_000_000_000L;
++
++    private static final class DelayStats {
++        private final List<Double> samplesMs = new ArrayList<>();
++        private double sumMs = 0.0;
++        private double maxMs = 0.0;
++
++        void record(double valueMs) {
++            samplesMs.add(valueMs);
++            sumMs += valueMs;
++            if (valueMs > maxMs) {
++                maxMs = valueMs;
++            }
++        }
++
++        long count() {
++            return samplesMs.size();
++        }
++
++        double meanMs() {
++            return samplesMs.isEmpty() ? 0.0 : sumMs / samplesMs.size();
++        }
++
++        double maxMs() {
++            return maxMs;
++        }
++    }
+ 
+     public enum HandlingOrderPolicy {
+         DEFAULT,
+@@ -159,15 +187,20 @@ public class Selector implements Selectable, AutoCloseable {
+ 
+     public static final class ReadSchedulingConfig {
+         private final HandlingOrderPolicy handlingOrderPolicy;
+         private final DrrConfig drrConfig;
++        private final boolean instrumentationEnabled;
+ 
+-        public ReadSchedulingConfig(HandlingOrderPolicy handlingOrderPolicy, DrrConfig drrConfig) {
++        public ReadSchedulingConfig(HandlingOrderPolicy handlingOrderPolicy,
++                                    DrrConfig drrConfig,
++                                    boolean instrumentationEnabled) {
+             this.handlingOrderPolicy = handlingOrderPolicy == null ? HandlingOrderPolicy.DEFAULT : handlingOrderPolicy;
+             this.drrConfig = drrConfig == null ? DrrConfig.defaultConfig() : drrConfig;
++            this.instrumentationEnabled = instrumentationEnabled;
+         }
+ 
+         public HandlingOrderPolicy handlingOrderPolicy() {
+             return handlingOrderPolicy;
+         }
+ 
+         public DrrConfig drrConfig() {
+             return drrConfig;
+         }
++
++        public boolean instrumentationEnabled() {
++            return instrumentationEnabled;
++        }
+ 
+         public static ReadSchedulingConfig defaultConfig() {
+-            return new ReadSchedulingConfig(HandlingOrderPolicy.DEFAULT, DrrConfig.defaultConfig());
++            return new ReadSchedulingConfig(HandlingOrderPolicy.DEFAULT, DrrConfig.defaultConfig(), false);
+         }
+     }
+@@ -222,6 +255,15 @@ public class Selector implements Selectable, AutoCloseable {
+     private final HandlingOrderPolicy handlingOrderPolicy;
+     private final DrrConfig drrConfig;
+     private final Map<String, Long> drrDeficits;
++    private final boolean schedulingInstrumentationEnabled;
++    private final String schedulingInstrumentationSelectorId;
++    private final Map<String, Long> schedulingFirstReadyNanos;
++    private final Map<String, Long> schedulingReadyCounts;
++    private final Map<String, Long> schedulingReadCounts;
++    private final Map<String, Long> schedulingSkipCounts;
++    private final Map<String, DelayStats> schedulingReadyToReadDelayStats;
++    private long lastSchedulingInstrumentationFlushNanos;
+ 
+     //indicates if the previous call to poll was able to make progress in reading already-buffered data.
+     //this is used to prevent tight loops when memory is not available to read any more data
+@@ -300,6 +342,15 @@ public class Selector implements Selectable, AutoCloseable {
+             readSchedulingConfig == null ? ReadSchedulingConfig.defaultConfig() : readSchedulingConfig;
+         this.handlingOrderPolicy = effectiveReadSchedulingConfig.handlingOrderPolicy();
+         this.drrConfig = effectiveReadSchedulingConfig.drrConfig();
++        this.schedulingInstrumentationEnabled = effectiveReadSchedulingConfig.instrumentationEnabled();
++        this.schedulingInstrumentationSelectorId = metricTags.getOrDefault("networkProcessor", "unknown");
++        this.schedulingFirstReadyNanos = schedulingInstrumentationEnabled ? new HashMap<>() : Collections.emptyMap();
++        this.schedulingReadyCounts = schedulingInstrumentationEnabled ? new HashMap<>() : Collections.emptyMap();
++        this.schedulingReadCounts = schedulingInstrumentationEnabled ? new HashMap<>() : Collections.emptyMap();
++        this.schedulingSkipCounts = schedulingInstrumentationEnabled ? new HashMap<>() : Collections.emptyMap();
++        this.schedulingReadyToReadDelayStats = schedulingInstrumentationEnabled ? new HashMap<>() : Collections.emptyMap();
++        this.lastSchedulingInstrumentationFlushNanos = time.nanoseconds();
+         this.drrDeficits = this.handlingOrderPolicy == HandlingOrderPolicy.DRR ? new HashMap<>() : Collections.emptyMap();
+         this.delayedClosingChannels = (failedAuthenticationDelayMs > NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap<>() : null;
+     }
+@@ -594,6 +645,9 @@ public class Selector implements Selectable, AutoCloseable {
+         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds(), false);
+ 
+         if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
++            Set<String> readyConnectionsThisPoll = schedulingInstrumentationEnabled ? new HashSet<>() : Collections.emptySet();
++            Set<String> readConnectionsThisPoll = schedulingInstrumentationEnabled ? new HashSet<>() : Collections.emptySet();
++
+             replenishDrrDeficits();
+             Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
+ 
+@@ -701,10 +755,20 @@ public class Selector implements Selectable, AutoCloseable {
+                 KafkaChannel channel = channel(key);
+                 if (channel == null)
+                     continue;
++                boolean readCandidate = channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
++                    && !explicitlyMutedChannels.contains(channel);
++                if (readCandidate) {
++                    markConnectionReady(channel.id(), readyConnectionsThisPoll);
++                }
+ 
+                 //if channel is ready and has bytes to read from socket or buffer, and has no
+                 //previous completed receive then read from it
+-                if (channel.ready() && (key.isReadable() || channel.hasBytesBuffered()) && !hasCompletedReceive(channel)
+-                        && !explicitlyMutedChannels.contains(channel) && canReadWithDrrBudget(channel)) {
++                if (readCandidate && canReadWithDrrBudget(channel)) {
++                    markConnectionRead(channel.id(), readConnectionsThisPoll);
+                     long bytesRead = attemptRead(channel);
+                     consumeDrrBudget(channel, bytesRead);
+                 }
+@@ -717,6 +781,8 @@ public class Selector implements Selectable, AutoCloseable {
+                     maybeRecordTimePerConnection(channel, channelStartTimeNanos);
+                 }
+             }
++            recordSkippedReadyConnections(readyConnectionsThisPoll, readConnectionsThisPoll);
++            flushSchedulingInstrumentationIfNeeded();
+         }
+ 
+         long endIo = time.nanoseconds();
+@@ -918,6 +984,104 @@ public class Selector implements Selectable, AutoCloseable {
+             drrDeficits.remove(connectionId);
+         }
+     }
++
++    private void markConnectionReady(String connectionId, Set<String> readyConnectionsThisPoll) {
++        if (!schedulingInstrumentationEnabled) {
++            return;
++        }
++        readyConnectionsThisPoll.add(connectionId);
++        schedulingReadyCounts.merge(connectionId, 1L, Long::sum);
++        schedulingFirstReadyNanos.putIfAbsent(connectionId, time.nanoseconds());
++    }
++
++    private void markConnectionRead(String connectionId, Set<String> readConnectionsThisPoll) {
++        if (!schedulingInstrumentationEnabled) {
++            return;
++        }
++        readConnectionsThisPoll.add(connectionId);
++        schedulingReadCounts.merge(connectionId, 1L, Long::sum);
++        Long firstReadyNanos = schedulingFirstReadyNanos.remove(connectionId);
++        if (firstReadyNanos != null) {
++            double delayMs = (time.nanoseconds() - firstReadyNanos) / 1_000_000.0;
++            schedulingReadyToReadDelayStats
++                .computeIfAbsent(connectionId, ignored -> new DelayStats())
++                .record(delayMs);
++        }
++    }
++
++    private void recordSkippedReadyConnections(Set<String> readyConnectionsThisPoll, Set<String> readConnectionsThisPoll) {
++        if (!schedulingInstrumentationEnabled) {
++            return;
++        }
++        for (String connectionId : readyConnectionsThisPoll) {
++            if (!readConnectionsThisPoll.contains(connectionId)) {
++                schedulingSkipCounts.merge(connectionId, 1L, Long::sum);
++            }
++        }
++    }
++
++    private void flushSchedulingInstrumentationIfNeeded() {
++        if (!schedulingInstrumentationEnabled) {
++            return;
++        }
++        long nowNanos = time.nanoseconds();
++        if (nowNanos - lastSchedulingInstrumentationFlushNanos < SCHEDULING_INSTRUMENTATION_FLUSH_INTERVAL_NANOS) {
++            return;
++        }
++
++        Set<String> connectionIds = new HashSet<>();
++        connectionIds.addAll(schedulingReadyCounts.keySet());
++        connectionIds.addAll(schedulingReadCounts.keySet());
++        connectionIds.addAll(schedulingSkipCounts.keySet());
++        connectionIds.addAll(schedulingReadyToReadDelayStats.keySet());
++
++        for (String connectionId : connectionIds) {
++            DelayStats delayStats = schedulingReadyToReadDelayStats.get(connectionId);
++            double delayMeanMs = delayStats == null ? 0.0 : delayStats.meanMs();
++            double delayP95Ms = delayStats == null ? 0.0 : percentile(delayStats.samplesMs, 0.95);
++            double delayMaxMs = delayStats == null ? 0.0 : delayStats.maxMs();
++
++            System.out.printf(Locale.ROOT,
++                "[selector-scheduling] ts_ns=%d policy=%s selector=%s connection=%s ready_count=%d read_count=%d skip_count=%d ready_to_read_delay_mean_ms=%.3f ready_to_read_delay_p95_ms=%.3f ready_to_read_delay_max_ms=%.3f%n",
++                nowNanos,
++                handlingOrderPolicy.name().toLowerCase(Locale.ROOT),
++                schedulingInstrumentationSelectorId,
++                connectionId,
++                schedulingReadyCounts.getOrDefault(connectionId, 0L),
++                schedulingReadCounts.getOrDefault(connectionId, 0L),
++                schedulingSkipCounts.getOrDefault(connectionId, 0L),
++                delayMeanMs,
++                delayP95Ms,
++                delayMaxMs);
++        }
++
++        schedulingReadyCounts.clear();
++        schedulingReadCounts.clear();
++        schedulingSkipCounts.clear();
++        schedulingReadyToReadDelayStats.clear();
++        lastSchedulingInstrumentationFlushNanos = nowNanos;
++    }
++
++    private double percentile(List<Double> samples, double percentile) {
++        if (samples.isEmpty()) {
++            return 0.0;
++        }
++        List<Double> sorted = new ArrayList<>(samples);
++        Collections.sort(sorted);
++        int idx = (int) Math.ceil(sorted.size() * percentile) - 1;
++        if (idx < 0) {
++            idx = 0;
++        }
++        if (idx >= sorted.size()) {
++            idx = sorted.size() - 1;
++        }
++        return sorted.get(idx);
++    }
++
++    private void clearSchedulingInstrumentationState(String connectionId) {
++        if (!schedulingInstrumentationEnabled) {
++            return;
++        }
++        schedulingFirstReadyNanos.remove(connectionId);
++        schedulingReadyCounts.remove(connectionId);
++        schedulingReadCounts.remove(connectionId);
++        schedulingSkipCounts.remove(connectionId);
++        schedulingReadyToReadDelayStats.remove(connectionId);
++    }
+ 
+     @Override
+     public List<NetworkSend> completedSends() {
+@@ -1181,6 +1345,7 @@ public class Selector implements Selectable, AutoCloseable {
+         this.sensors.connectionClosed.record();
+         this.explicitlyMutedChannels.remove(channel);
+         clearDrrDeficit(channel.id());
++        clearSchedulingInstrumentationState(channel.id());
+         if (notifyDisconnect)
+             this.disconnected.put(channel.id(), channel.state());
+     }
+diff --git a/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java b/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
+index d43638a..6b109b3 100644
+--- a/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
++++ b/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java
+@@ -184,6 +184,12 @@ public class SocketServerConfigs {
+     public static final String SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DOC =
+             "If true, DRR charges read cost based on bytes read (with minimum cost). If false, DRR charges a fixed " +
+                     "cost of 1 per read attempt.";
++
++    public static final String SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_CONFIG =
++            "socket.read.scheduling.instrumentation.enable";
++    public static final boolean SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_DEFAULT = false;
++    public static final String SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_DOC =
++            "If true, emits selector scheduling instrumentation logs for ready/read/skip counts and ready-to-read delay.";
+ 
+     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
+             .define(LISTENERS_CONFIG, STRING, LISTENERS_DEFAULT, HIGH, LISTENERS_DOC)
+@@ -212,7 +218,9 @@ public class SocketServerConfigs {
+                     atLeast(1), MEDIUM, SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_DOC)
+             .define(SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG, BOOLEAN,
+                     SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DEFAULT, MEDIUM,
+-                    SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DOC);
++                    SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DOC)
++            .define(SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_CONFIG, BOOLEAN,
++                    SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_DEFAULT, LOW, SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_DOC);
+ 
+     private static final Pattern URI_PARSE_REGEXP = Pattern.compile(
+         "^(.*)://\\[?([0-9a-zA-Z\\-%._:]*)\\]?:(-?[0-9]+)");
+diff --git a/core/src/main/scala/kafka/server/KafkaConfig.scala b/core/src/main/scala/kafka/server/KafkaConfig.scala
+index 69a1d27..78566b0 100755
+--- a/core/src/main/scala/kafka/server/KafkaConfig.scala
++++ b/core/src/main/scala/kafka/server/KafkaConfig.scala
+@@ -309,6 +309,7 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
+   val socketReadSchedulingDrrMinCost = getLong(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MIN_COST_CONFIG)
+   val socketReadSchedulingDrrMaxDeficit = getLong(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_MAX_DEFICIT_CONFIG)
+   val socketReadSchedulingDrrEnableBytesCost = getBoolean(SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG)
++  val socketReadSchedulingInstrumentationEnable = getBoolean(SocketServerConfigs.SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_CONFIG)
+ 
+   /***************** rack configuration **************/
+   val rack = Option(getString(ServerConfigs.BROKER_RACK_CONFIG))
+diff --git a/core/src/main/scala/kafka/network/SocketServer.scala b/core/src/main/scala/kafka/network/SocketServer.scala
+index c43d7c9..4c389ff 100644
+--- a/core/src/main/scala/kafka/network/SocketServer.scala
++++ b/core/src/main/scala/kafka/network/SocketServer.scala
+@@ -895,16 +895,17 @@ private[kafka] class Processor(
+       true,
+       channelBuilder,
+       memoryPool,
+       logContext,
+       new KSelector.ReadSchedulingConfig(
+         KSelector.HandlingOrderPolicy.forName(config.socketReadSchedulingPolicy),
+         new KSelector.DrrConfig(
+           config.socketReadSchedulingDrrQuantum,
+           config.socketReadSchedulingDrrMinCost,
+           config.socketReadSchedulingDrrMaxDeficit,
+           config.socketReadSchedulingDrrEnableBytesCost
+-        )
++        ),
++        config.socketReadSchedulingInstrumentationEnable
+       ))
+   }
+diff --git a/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java b/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
+index f87dd83..7e296b1 100644
+--- a/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
++++ b/server/src/test/java/org/apache/kafka/network/SocketServerConfigsTest.java
+@@ -120,6 +120,11 @@ public class SocketServerConfigsTest {
+                 SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_DEFAULT,
+                 SocketServerConfigs.CONFIG_DEF.configKeys().get(
+                         SocketServerConfigs.SOCKET_READ_SCHEDULING_DRR_ENABLE_BYTES_COST_CONFIG).defaultValue
++        );
++        assertEquals(
++                SocketServerConfigs.SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_DEFAULT,
++                SocketServerConfigs.CONFIG_DEF.configKeys().get(
++                        SocketServerConfigs.SOCKET_READ_SCHEDULING_INSTRUMENTATION_ENABLE_CONFIG).defaultValue
+         );
+     }

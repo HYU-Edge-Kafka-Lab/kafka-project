@@ -1,111 +1,195 @@
-# Kafka 4.1.0 DRR Patch + Experiment Guide
+# Kafka Selector Scheduling Policy 실험 프로젝트
 
-이 저장소에서 외부에 공유해야 할 핵심은 두 가지입니다.
+Kafka Broker의 Network Thread / Selector 처리 구조를 분석하고, read scheduling policy에 따라 외부 응답 특성과 내부 상태가 어떻게 달라지는지 관찰하는 프로젝트입니다.
 
-- Kafka 4.1.0 `Selector` read scheduling용 DRR patch bundle
-- patch 적용 후 fairness 실험을 돌리는 harness
+## 프로젝트 목적
 
-## 포함 파일
+| 구분 | 내용 |
+|------|------|
+| 목적 1 | Kafka Broker의 Network Thread / Selector 처리 구조를 이해하고 문서화 |
+| 목적 2 | `default`, `shuffle`, `drr` 정책을 비교할 수 있는 실험 환경 구성 |
+| 목적 3 | DRR의 deficit 기반 stateful 메커니즘 구현 및 계측 |
 
-- [`patches/kafka-4.1.0-drr-bundles`](/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles)
-- [`scripts/run-scenario.sh`](/Users/taehee/personal/kafka-project/scripts/run-scenario.sh)
-- [`src/main/java/com/kafka/io/kafkaproject/scenarios/ScenarioRunner.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/scenarios/ScenarioRunner.java)
-- [`src/main/java/com/kafka/io/kafkaproject/analysis/metrics/LogSummaryTool.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/analysis/metrics/LogSummaryTool.java)
-- [`src/main/java/com/kafka/io/kafkaproject/logging/StageLogger.java`](/Users/taehee/personal/kafka-project/src/main/java/com/kafka/io/kafkaproject/logging/StageLogger.java)
+## 기술 스택
+
+- **Kafka**: 4.1.0
+- **Java**: JDK 21 (Temurin)
+- **Spring Boot**: 4.0.2
+- **브로커 모드**: KRaft
 
 ## 전제
 
-- 이 저장소에는 Kafka 브로커 소스 전체가 없습니다.
-- DRR는 Kafka 4.1.0 소스 트리에 patch로 적용해야 합니다.
-- 현재 [`docker-compose.yml`](/Users/taehee/personal/kafka-project/docker-compose.yml)과 [`scripts/start-broker.sh`](/Users/taehee/personal/kafka-project/scripts/start-broker.sh)는 순정 Kafka 경로라 DRR 실험용이 아닙니다.
+- 이 저장소에는 Kafka 브로커 소스 전체가 포함되어 있지 않습니다.
+- DRR는 Kafka 4.1.0 소스 트리에 patch bundle을 적용하는 방식으로 사용합니다.
+- 저장소에는 patch bundle, 실험 harness, 정책별 broker 설정, 결과 요약 코드가 함께 포함되어 있습니다.
 
-## 1. Kafka 4.1.0 준비
+## 프로젝트 구조
 
-Kafka 4.1.0 소스 트리 두 개를 준비합니다.
-
-```bash
-/path/to/kafka-4.1.0-pristine
-/path/to/kafka-4.1.0-drr
+```text
+kafka-project/
+├── src/main/java/com/kafka/io/kafkaproject/
+│   ├── analysis/                          # 구조 분석 및 로그 요약
+│   ├── clients/                           # producer / consumer
+│   ├── config/                            # 실험 설정 상수
+│   ├── logging/                           # stage 로그 기록
+│   └── scenarios/                         # S0 / S1 / S2 / S1N 실행기
+├── scripts/                               # 브로커 기동 및 시나리오 실행 스크립트
+├── docker/                                # 정책별 broker 설정
+├── patches/                               # Kafka patch bundle
+├── results/                               # 실험 결과
+├── docs/                                  # 구조 문서
+├── KICKOFF.md
+└── README.md
 ```
 
-## 2. DRR patch 적용
+## 실험 시나리오
+
+저장소에는 여러 탐색 시나리오가 포함되어 있다. 다만 최종 보고서의 핵심 비교는 강한 contention 조건을 만들기 위한 `S2`를 기준으로 수행하였다.
+
+| ID | 설명 |
+|----|------|
+| S0 | Heavy 500 TPS / Light 500 TPS baseline 탐색 |
+| S1 | Heavy 3000 TPS / Light 500 TPS 비대칭 부하 탐색 |
+| S2 | Heavy 6개 × 500 TPS / Light 1개 × 500 TPS, 최종 비교 기준 |
+| S1N | Heavy 1000 TPS / Light 5개 × 500 TPS 보조 탐색 |
+
+## 로그 포맷
+
+```text
+ts|thread|clientId|stage|requestId|latency_ms
+```
+
+예시:
+
+```text
+2024-01-15T10:30:00.123|network-thread-0|heavy-producer-1|ack_received|12345|2.5
+```
+
+## Patch Bundle 사용
+
+Kafka 4.1.0 소스 트리를 별도로 준비한 뒤, `patches/kafka-4.1.0-drr-bundles` 아래 스크립트를 사용해 DRR patch를 적용할 수 있습니다.
+
+예시:
 
 ```bash
-/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles/apply-and-verify.sh \
-  /path/to/kafka-4.1.0-drr
+patches/kafka-4.1.0-drr-bundles/apply-and-verify.sh /path/to/kafka-4.1.0-drr
 ```
 
 baseline 비교:
 
 ```bash
-/Users/taehee/personal/kafka-project/patches/kafka-4.1.0-drr-bundles/compare-pristine-and-patched.sh \
+patches/kafka-4.1.0-drr-bundles/compare-pristine-and-patched.sh \
   /path/to/kafka-4.1.0-pristine \
   /path/to/kafka-4.1.0-drr
 ```
 
-## 3. 브로커 설정
+## 빠른 시작
 
-patch 적용 후, DRR broker의 `config/kraft/server.properties`에 아래 설정을 추가합니다.
-
-```properties
-socket.read.scheduling.policy=drr
-socket.read.scheduling.drr.quantum=1
-socket.read.scheduling.drr.min.cost=1
-socket.read.scheduling.drr.max.deficit=8
-socket.read.scheduling.drr.enable.bytes.cost=false
-```
-
-비교 실험 시 설정값:
-
-- baseline: `socket.read.scheduling.policy=default`
-- shuffle: `socket.read.scheduling.policy=shuffle`
-- drr: 위 5개 설정 사용
-
-## 4. DRR broker 실행
-
-예시:
+### 1. 빌드
 
 ```bash
-KAFKA_HOME=/path/to/kafka-4.1.0-drr
-CONFIG_FILE="$KAFKA_HOME/config/kraft/server.properties"
-
-KAFKA_CLUSTER_ID=$("$KAFKA_HOME/bin/kafka-storage.sh" random-uuid)
-"$KAFKA_HOME/bin/kafka-storage.sh" format -t "$KAFKA_CLUSTER_ID" -c "$CONFIG_FILE"
-"$KAFKA_HOME/bin/kafka-server-start.sh" "$CONFIG_FILE"
-```
-
-현재 실험 코드는 broker 주소를 `localhost:9092`로 가정합니다.
-
-## 5. 실험 harness 빌드
-
-```bash
-cd /Users/taehee/personal/kafka-project
 ./gradlew build
 ```
 
-## 6. 실험 실행
-
-결과 로그는 `results/<scenario>/`에 append 되므로 재실행 전 삭제를 권장합니다.
+### 2. 브로커 시작
 
 ```bash
-rm -rf results/S0 results/S1 results/S1N
+./scripts/start-broker.sh
+```
+
+### 3. 시나리오 실행
+
+```bash
+# 최종 보고서 기준 시나리오
+./scripts/run-scenario.sh S2 60 default
+./scripts/run-scenario.sh S2 60 shuffle
+./scripts/run-scenario.sh S2 60 drr
+
+# 탐색 시나리오
 ./scripts/run-scenario.sh S0 60
 ./scripts/run-scenario.sh S1 120
 ./scripts/run-scenario.sh S1N 120
 ```
 
-지원 시나리오:
-
-- `S0`: balanced baseline
-- `S1`: heavy vs single light
-- `S1N`: heavy vs many light
-
-## 7. 결과 확인
+### 4. 결과 확인
 
 ```bash
-sed -n '1,20p' results/S0/summary.csv
-sed -n '1,20p' results/S1/summary.csv
-sed -n '1,20p' results/S1N/summary.csv
+ls results/
 ```
 
-기본 요약 대상은 `ack_received`, `service_gap`입니다.
+## DRR Kafka Docker 실행
+
+패치 Kafka는 기본 compose가 아니라 정책별 compose를 사용합니다.
+
+1. 패치된 Kafka 소스를 준비하고 patch를 적용합니다.
+2. 로컬 이미지 생성:
+
+```bash
+PATCHED_KAFKA_ROOT=/tmp/kafka-4.1.0-drr ./scripts/build-drr-docker-image.sh
+```
+
+3. DRR 브로커 시작:
+
+```bash
+./scripts/start-drr-broker.sh
+```
+
+4. 실험 실행:
+
+```bash
+./scripts/run-scenario.sh S2 60 drr
+```
+
+## Default / Shuffle / DRR 실행 경로
+
+### Default broker
+
+```bash
+./scripts/start-default-broker.sh
+GRADLE_USER_HOME=/tmp/kafka-project-gradle ./scripts/run-scenario.sh S2 60 default
+```
+
+### Shuffle broker
+
+```bash
+./scripts/start-shuffle-broker.sh
+GRADLE_USER_HOME=/tmp/kafka-project-gradle ./scripts/run-scenario.sh S2 60 shuffle
+```
+
+### DRR broker
+
+```bash
+./scripts/start-drr-broker.sh
+GRADLE_USER_HOME=/tmp/kafka-project-gradle ./scripts/run-scenario.sh S2 60 drr
+```
+
+## 1-thread 실험 경로
+
+최종 보고서의 강한 contention 비교는 `num.network.threads=1` 경로를 기준으로 수행하였다.
+
+```bash
+./scripts/start-default-1thread-broker.sh
+./scripts/run-scenario.sh S2 60 default
+
+./scripts/start-shuffle-1thread-broker.sh
+./scripts/run-scenario.sh S2 60 shuffle
+
+./scripts/start-drr-1thread-broker.sh
+./scripts/run-scenario.sh S2 60 drr
+```
+
+## 주요 분석 대상 클래스
+
+| 클래스 | 역할 |
+|--------|------|
+| `kafka.network.SocketServer` | Acceptor, Processor 관리 |
+| `kafka.network.Processor` | Network Thread 구현체 |
+| `org.apache.kafka.common.network.Selector` | NIO Selector 래퍼 |
+| `kafka.network.RequestChannel` | Request/Response 큐 |
+
+## 참고 문서
+
+- [docs/architecture.md](./docs/architecture.md)
+- [docs/stage-mapping.md](./docs/stage-mapping.md)
+
+초기 실험 구상과 중간 설계 메모는 `KICKOFF.md`, `KICKOFF2.md`에 남아 있다. 해당 문서들은 작업 이력용 참고 자료이며, 최종 보고서 기준은 README와 보고서 본문을 따른다.
